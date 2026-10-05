@@ -1,5 +1,7 @@
 # Standalone 3x-ui VPS
 
+**Documentation in Russian:** [README.ru.md](README.ru.md). The English documentation is the default for this repository.
+
 Ansible control plane for **one new Ubuntu 24.04 VPS**. It starts with provider `root`/password access, establishes a key-only `ops` account with passwordless sudo, then installs a standalone 3x-ui panel, subscription endpoint, VLESS/TLS and optional Hysteria2. This VPS is its own controller; registration of future remote nodes is a later, separate operation.
 
 The source playbooks were adapted from `vps-fleet-ops` at repository creation. They retain explicit single-host scope, exact installer tag plus checksum, local bearer API, SQLite backup, and sanitized outputs. No existing fleet inventory or controller is needed.
@@ -7,15 +9,15 @@ The source playbooks were adapted from `vps-fleet-ops` at repository creation. T
 ## Controller prerequisites
 
 - Python 3.10+, `ansible-core`, OpenSSH client and `ssh-keygen`; `sshpass` is required by Ansible's interactive `--ask-pass` bootstrap mode.
-- A new Ubuntu 24.04 VPS with working provider console, initial root/password SSH, a public IPv4 address, and enough memory and disk for 3x-ui and Nginx.
+- A new Ubuntu 24.04 VPS with working provider console, initial root/password access through SSH or that console, a public IPv4 address, and enough memory and disk for 3x-ui and Nginx.
 - A public DNS name resolving to the VPS. Confirm provider firewall allows the selected SSH, `80/tcp`, VLESS TCP, subscription TCP, and optional Hysteria UDP ports. Panel access should allow only the configured administration CIDRs.
 - Review the 3x-ui installer tag and SHA256 in `ansible/playbooks/3x-ui-install.yml` before deployment. This repository pins `v3.7.0`; it does not silently select a newer release.
 
-Real settings, credentials, backups and exports are excluded from Git. The root password is requested by Ansible at the terminal during bootstrap and is never stored in `.env`. Before bootstrap, make one manual SSH connection to the VPS from the controller, compare the displayed host-key fingerprint with the provider console, and accept it into local `known_hosts` only when it matches. The launcher uses `StrictHostKeyChecking=yes` and never auto-accepts a new host key.
+Real settings, credentials, backups and exports are excluded from Git. The root password is requested by Ansible at the terminal during bootstrap and is never stored in `.env`. Before bootstrap, compare the VPS SSH host-key fingerprint with the provider console and add the verified key to local `known_hosts`. Use the [console bootstrap guide](docs/bootstrap-console.md) if root SSH is disabled. The launcher uses `StrictHostKeyChecking=yes` and never auto-accepts a new host key.
 
 ## First deployment
 
-1. `cp .env.example .env` and edit `.env`. Choose a separate panel port and subscription port. `VLESS_PORT=443` is TCP; `HYSTERIA_PORT=443` is UDP, so the two may share the number. Set `ENABLE_HYSTERIA=no` to omit Hysteria2 and its UDP rule. If `CHANGE_SSH_PORT=no`, set `SSH_TARGET_PORT` equal to `BOOTSTRAP_SSH_PORT`; retaining SSH `22` is an explicit exception to the source fleet policy.
+1. `cp .env.example .env` and edit `.env`. A Russian-commented template is also available as `.env.ru.example`. Choose a separate panel port and subscription port. `VLESS_PORT=443` is TCP; `HYSTERIA_PORT=443` is UDP, so the two may share the number. Set `ENABLE_HYSTERIA=no` to omit Hysteria2 and its UDP rule. If `CHANGE_SSH_PORT=no`, set `SSH_TARGET_PORT` equal to `BOOTSTRAP_SSH_PORT`; retaining SSH `22` is an explicit exception to the source fleet policy.
 2. `python3 bin/vps.py plan`. Review the displayed firewall plan, DNS, provider firewall, and console recovery access.
 3. Run `python3 bin/vps.py keygen` for a new local key, or point `SSH_KEY_PATH` at an existing key pair. Key generation prompts for a passphrase; add a passphrase-protected key to `ssh-agent` before deployment. The private key never leaves the controller.
 4. Run `python3 bin/vps.py bootstrap --apply`. Ansible prompts for the initial root password. If the provider permits root access only through its console, follow [manual console bootstrap](docs/bootstrap-console.md) and then run `python3 bin/vps.py verify-access` after setting `CHANGE_SSH_PORT=no` and both SSH port values to the current port in `.env`. Restore the intended port settings before `check-network`. This creates the operations account, installs **only the public key**, writes a validated `sudoers.d` file, and probes a fresh key-only `sudo -n` login. The old root/password path is still available if this fails.

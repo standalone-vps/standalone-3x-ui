@@ -53,3 +53,10 @@ def test_dotenv_is_not_shell_code(tmp_path):
     path.write_text(path.read_text() + "\nUNEXPECTED=$(touch /tmp/should-not-run)\n")
     with pytest.raises(ValueError):
         vps.load_env(path)
+
+
+def test_russian_example_matches_english_settings():
+    root = SCRIPT.parents[1]
+    english = vps.load_env(root / ".env.example")
+    russian = vps.load_env(root / ".env.ru.example")
+    assert russian == english
