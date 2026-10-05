@@ -50,7 +50,7 @@
       ansible.builtin.set_fact:
         verify_runtime: "{{ verify_runtime_raw.stdout | from_json }}"
 
-    - name: Require expected listeners, restricted panel and services
+    - name: Require expected listeners, panel access and services
       ansible.builtin.assert:
         that:
           - verify_runtime.tcp[target_ssh_port | string] | bool
