@@ -41,6 +41,14 @@
       register: network_ufw_before
       check_mode: false
 
+    - name: Block IPv6 traffic in UFW
+      ansible.builtin.lineinfile:
+        path: /etc/default/ufw
+        regexp: '^IPV6='
+        line: 'IPV6=no'
+        backup: true
+      register: network_ipv6_policy
+
     - name: Set incoming policy
       ansible.builtin.command: ufw default deny incoming
       when:
@@ -90,6 +98,14 @@
       when:
         - not ansible_check_mode
         - "'status: inactive' in network_ufw_before.stdout | lower"
+
+    - name: Reload active UFW after IPv6 policy change
+      ansible.builtin.command: ufw reload
+      changed_when: true
+      when:
+        - not ansible_check_mode
+        - network_ipv6_policy.changed
+        - "'status: active' in network_ufw_before.stdout | lower"
 
     - name: Ensure SSH config directory exists
       ansible.builtin.file:

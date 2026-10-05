@@ -1,5 +1,6 @@
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
+import sys
 
 import pytest
 
@@ -66,3 +67,9 @@ def test_russian_example_matches_english_settings():
     english = vps.load_env(root / ".env.example")
     russian = vps.load_env(root / ".env.ru.example")
     assert russian == english
+
+
+def test_close_ipv6_requires_apply_before_network(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["vps.py", "close-ipv6", "--env", str(config(tmp_path))])
+    assert vps.main() == 1
+    assert "--apply" in capsys.readouterr().err

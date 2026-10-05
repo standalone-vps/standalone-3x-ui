@@ -1,0 +1,62 @@
+---
+- name: Block IPv6 traffic on one installed VPS
+  hosts: standalone
+  gather_facts: true
+  become: true
+  vars:
+    allow_ipv6_firewall_apply: false
+  pre_tasks:
+    - name: Require one reviewed Ubuntu VPS and explicit approval
+      ansible.builtin.assert:
+        that:
+          - ansible_limit == 'standalone'
+          - ansible_play_hosts_all | length == 1
+          - allow_ipv6_firewall_apply | bool
+          - ansible_distribution == 'Ubuntu'
+          - ansible_distribution_major_version | int == 24
+          - ansible_user == ops_user
+          - ansible_port | int == target_ssh_port | int
+
+    - name: Read current UFW state
+      ansible.builtin.command: ufw status verbose
+      changed_when: false
+      check_mode: false
+      register: ipv6_ufw_before
+
+    - name: Require active UFW before changing its IPv6 policy
+      ansible.builtin.assert:
+        that:
+          - "'Status: active' in ipv6_ufw_before.stdout"
+        fail_msg: UFW is inactive. Review the baseline firewall before changing IPv6 policy.
+
+  tasks:
+    - name: Show change and rollback
+      ansible.builtin.debug:
+        msg:
+          - "UFW will block IPv6 outside loopback. IPv4 access stays configured."
+          - "The file task backs up /etc/default/ufw before changing it. Restore that backup and run ufw reload to roll back."
+          - "A repeat run does not reload UFW when IPV6=no is already set."
+
+    - name: Block IPv6 traffic except loopback
+      ansible.builtin.lineinfile:
+        path: /etc/default/ufw
+        regexp: '^IPV6='
+        line: 'IPV6=no'
+        backup: true
+      register: ipv6_policy
+
+    - name: Reload UFW when IPv6 policy changed
+      ansible.builtin.command: ufw reload
+      changed_when: true
+      when:
+        - ipv6_policy.changed
+        - not ansible_check_mode
+
+    - name: Confirm IPv6 policy is active
+      ansible.builtin.shell: |
+        grep -qx 'IPV6=no' /etc/default/ufw
+        ufw status verbose | grep -q 'Status: active'
+      args:
+        executable: /bin/bash
+      changed_when: false
+      when: not ansible_check_mode

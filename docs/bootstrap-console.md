@@ -5,10 +5,10 @@
 Use this guide only if the provider blocks `root` login over SSH. For the normal `root`/password SSH case, use the [main guide](../README.md). The commands below create the same `ops` account through the provider's browser console.
 
 ```text
-Linux key → provider console as root → create ops → test SSH → install
+Linux/WSL key → provider console as root → create ops → test SSH → install
 ```
 
-1. On your **Linux computer**, create the key and show its public line:
+1. In your **Linux or Ubuntu terminal**, create the key and show its public line:
 
    ```sh
    mkdir -p "$HOME/.ssh"
@@ -17,7 +17,7 @@ Linux key → provider console as root → create ops → test SSH → install
    cat "$HOME/.ssh/standalone_3x_ui_ed25519.pub"
    ```
 
-   Enter a passphrase. If the key exists, do not overwrite it. Copy the full public line beginning with `ssh-ed25519`.
+   Enter a passphrase. If the key already exists, do not overwrite it; only display its `.pub` file. On Windows, use the PowerShell and WSL commands in [step 1 of the main guide](../README.md). Copy the full public line beginning with `ssh-ed25519`.
 
 2. Open the provider's browser console and sign in to the VPS as `root`. Run **on the VPS**:
 
@@ -45,7 +45,7 @@ Linux key → provider console as root → create ops → test SSH → install
    visudo -cf /etc/sudoers.d/90-standalone-ops
    ```
 
-3. Keep the console open. In that console, run `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` and note the fingerprint. On your **Linux computer**, test SSH on the VPS's current port:
+3. Keep the console open. In that console, run `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` and note the fingerprint. In your **Linux or Ubuntu terminal**, test SSH on the VPS's current port:
 
    ```sh
    ssh -i "$HOME/.ssh/standalone_3x_ui_ed25519" -p 22 ops@YOUR_VPS_IP

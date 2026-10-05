@@ -2,26 +2,48 @@
 
 [Читать по-русски](README.ru.md)
 
-This guide starts with a **Linux computer** and a **new Ubuntu 24.04 VPS**. You can sign in to the VPS as `root` with a password over SSH. You will create an `ops` account, then install 3x-ui from your Linux computer.
+This guide starts with a **Linux computer**, or **Windows with Ubuntu in WSL**, and a **new Ubuntu 24.04 VPS**. You can sign in to the VPS as `root` with a password over SSH. You will create an `ops` account, then install 3x-ui from a Linux terminal.
 
-Run every command in the place named above its code block. Ansible is the program that runs the installation steps over SSH. Do not put passwords or private keys in `.env`.
+Run every command in the place named above its code block. A Linux terminal means native Linux or Ubuntu in WSL. Ansible is the program that runs the installation steps over SSH. Do not put passwords or private keys in `.env`.
 
 ```text
-Linux computer → SSH as root → create ops → test ops → install 3x-ui → test a client
+Linux or Windows/WSL → SSH as root → create ops → test ops → install 3x-ui → test a client
 ```
 
 ## Before you start
 
 You need the VPS IP address, its `root` password, and a domain name pointing to that IP address. This guide uses SSH port `22`; replace it in SSH commands if your provider uses another port. Keep access to your provider's VPS recovery console in case SSH stops working.
 
-Open a terminal **on your Linux computer** in the directory containing this README. If that computer uses Ubuntu or Debian, install the local tools:
+On Linux, open a terminal in the repository directory. On Ubuntu or Debian, install the local tools:
 
 ```sh
 sudo apt update
 sudo apt install -y ansible-core openssh-client python3 nano curl
 ```
 
-Other Linux distributions need the same tools from their own package manager. Check that you are in the repository directory:
+Other Linux distributions need the same tools from their own package manager.
+
+### If your computer runs Windows
+
+1. Open **PowerShell as Administrator**. Install Ubuntu in WSL if it is missing:
+
+   ```powershell
+   wsl --install -d Ubuntu
+   ```
+
+2. Restart Windows if asked. Open **Ubuntu** from the Start menu. Create a Linux user when prompted.
+3. In the Ubuntu terminal, install the same tools:
+
+   ```sh
+   sudo apt update
+   sudo apt install -y ansible-core openssh-client python3 nano curl
+   ```
+
+4. Open the repository directory in the Ubuntu terminal. Windows drive `C:` appears under `/mnt/c/`.
+
+All commands after the PowerShell key commands below run in the **Linux or Ubuntu terminal**.
+
+Check that you are in the repository directory:
 
 ```sh
 ls bin/vps.py
@@ -29,9 +51,11 @@ ls bin/vps.py
 
 This command must display `bin/vps.py`. Run `python3 --version` too. The version must be 3.10 or newer.
 
-## 1. Create an SSH key on your Linux computer
+## 1. Create an SSH key
 
 An SSH key has two files. The file ending in `.pub` is the **public key**. You will copy its contents to the VPS. The other file is the **private key**; it stays on your computer.
+
+**Linux:** run these commands in the Linux terminal:
 
 ```sh
 mkdir -p "$HOME/.ssh"
@@ -39,17 +63,40 @@ chmod 700 "$HOME/.ssh"
 ssh-keygen -t ed25519 -a 100 -f "$HOME/.ssh/standalone_3x_ui_ed25519"
 ```
 
+**Windows:** run these commands in **PowerShell**. If `ssh-keygen.exe` is missing, run `Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0` in Administrator PowerShell.
+
+```powershell
+New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\.ssh" | Out-Null
+ssh-keygen.exe -t ed25519 -a 100 -f "$env:USERPROFILE\.ssh\standalone_3x_ui_ed25519"
+Get-Content "$env:USERPROFILE\.ssh\standalone_3x_ui_ed25519.pub"
+```
+
 Enter and confirm a passphrase when asked. If `ssh-keygen` says the file exists, answer **no**. Reuse it only if it is your key and its `.pub` file exists. Otherwise choose another filename in **all later commands** and in `.env`.
 
-Display the public key and keep this terminal open:
+On Linux, display the public key:
 
 ```sh
 cat "$HOME/.ssh/standalone_3x_ui_ed25519.pub"
 ```
 
-Copy the full line beginning with `ssh-ed25519`. Do not copy the private key.
+Copy the full line beginning with `ssh-ed25519`. Never copy the private key to the VPS.
 
-## 2. Fill in `.env` on your Linux computer
+**Windows:** copy the key into Ubuntu before installation. Run this block in the **Ubuntu terminal**:
+
+```sh
+windows_profile="$(wslpath "$(cmd.exe /c echo %USERPROFILE% | tr -d '\r')")"
+install -d -m 700 "$HOME/.ssh"
+if [ -e "$HOME/.ssh/standalone_3x_ui_ed25519" ] || [ -e "$HOME/.ssh/standalone_3x_ui_ed25519.pub" ]; then
+  echo "A key already exists in WSL. Stop and inspect it."
+else
+  install -m 600 "$windows_profile/.ssh/standalone_3x_ui_ed25519" "$HOME/.ssh/standalone_3x_ui_ed25519"
+  install -m 644 "$windows_profile/.ssh/standalone_3x_ui_ed25519.pub" "$HOME/.ssh/standalone_3x_ui_ed25519.pub"
+fi
+```
+
+The installer uses this WSL copy. Keep `SSH_KEY_PATH=~/.ssh/standalone_3x_ui_ed25519` in `.env`.
+
+## 2. Fill in `.env`
 
 `.env` is the settings file for this VPS. The repository ignores the real `.env` file in Git. If it already exists, `cp -n` keeps it.
 
@@ -72,7 +119,7 @@ Save `.env` in `nano`: press **Ctrl+O**, **Enter**, then **Ctrl+X**. `Ctrl+O` us
 
 ## 3. Sign in to the VPS as root and create ops
 
-Open a **second terminal on your Linux computer**. Replace `YOUR_VPS_IP` with the address from `VPS_HOST`:
+Open a **second Linux or Ubuntu terminal**. Replace `YOUR_VPS_IP` with the address from `VPS_HOST`:
 
 ```sh
 ssh -p 22 root@YOUR_VPS_IP
@@ -129,7 +176,7 @@ The last command must report that the file parsed successfully. Keep the `root` 
 
 ## 4. Test the new account
 
-Open a **third terminal on your Linux computer**. Connect on the current SSH port, which is still `22`:
+Open a **third Linux or Ubuntu terminal**. Connect on the current SSH port, which is still `22`:
 
 ```sh
 ssh -i "$HOME/.ssh/standalone_3x_ui_ed25519" -p 22 ops@YOUR_VPS_IP
@@ -144,7 +191,7 @@ exit
 
 `sudo -n true` must finish without a password prompt or error. If it fails, fix the public key, permissions, or sudoers file in the still-open `root` session. Once it works, type `exit` in the `root` session too.
 
-## 5. Install 3x-ui from your Linux computer
+## 5. Install 3x-ui from the Linux or Ubuntu terminal
 
 Return to the **first terminal** in the repository directory. Load your key into an SSH agent. The agent lets the installer use a passphrase-protected key:
 
@@ -165,9 +212,9 @@ Before installation, allow these ports in the **provider firewall**, if your pro
 | `443/udp` | Clients using Hysteria2, only when enabled. |
 | `39089/tcp` | The public internet, for the panel. |
 
-Use your chosen `.env` port numbers if you changed the examples. The installer configures the VPS firewall. It cannot configure the provider firewall. Once SSH works on `2322`, remove the old `22/tcp` provider rule if you changed ports.
+Use your chosen `.env` port numbers if you changed the examples. Open the provider ports for **IPv4 only**. The installer configures UFW to block IPv6 traffic except loopback. Do not add a DNS `AAAA` record for this VPS. The installer cannot configure the provider firewall. Once SSH works on `2322`, remove the old `22/tcp` provider rule if you changed ports.
 
-Run these commands **on your Linux computer**, one at a time:
+Run these commands **in your Linux or Ubuntu terminal**, one at a time:
 
 1. Display the settings and check the ports:
 
@@ -195,7 +242,7 @@ Run these commands **on your Linux computer**, one at a time:
 
 ## 6. Open the panel and test a client
 
-After installation, SSH uses the port in `SSH_TARGET_PORT`. For the example settings, run this **on your Linux computer**:
+After installation, SSH uses the port in `SSH_TARGET_PORT`. For the example settings, run this **in your Linux or Ubuntu terminal**:
 
 ```sh
 ssh -i "$HOME/.ssh/standalone_3x_ui_ed25519" -p 2322 ops@YOUR_VPS_IP
@@ -220,13 +267,22 @@ The installer checks services and ports. Only this external client test proves t
 
 The public website is at `https://DOMAIN/` on port `443`. It shows a small API page. `https://DOMAIN/api/status` returns JSON. The VPS chooses its page from its machine ID. A new VPS gets its own page and node ID; rerunning the playbook keeps the same page. HTTPS traffic reaches Nginx through the VLESS/TLS fallback on local port `8000`. Port `8000` stays closed to the internet.
 
-To update the page on an existing VPS, run this **on your Linux computer**:
+To update the page on an existing VPS, run this **in your Linux or Ubuntu terminal**:
 
 ```sh
 python3 bin/vps.py update-page --apply
 ```
 
 This command updates only the fallback website. It does not recreate the panel or inbounds.
+
+To close IPv6 on an **already installed VPS**, run this in your Linux or Ubuntu terminal:
+
+```sh
+python3 bin/vps.py close-ipv6 --apply
+python3 bin/vps.py verify
+```
+
+UFW blocks IPv6 outside the VPS loopback interface. SSH, the panel and clients continue over IPv4.
 
 
 ## If a command stops
@@ -235,4 +291,4 @@ Do not repeat `deploy --apply` without checking the VPS state. The installer can
 
 The panel version is pinned in `X_UI_VERSION` and the installer playbook. A future release needs a reviewed update; this guide does not select one automatically. This VPS can later become a controller for other 3x-ui nodes, but this installation changes only this VPS.
 
-If your provider blocks `root` login over SSH, use the separate [provider-console procedure](docs/bootstrap-console.md). If you use Windows, see the [Windows key commands](docs/ssh-keys-windows.md); run the installer in Linux or WSL.
+If your provider blocks `root` login over SSH, use the separate [provider-console procedure](docs/bootstrap-console.md). The [Windows key reference](docs/ssh-keys-windows.md) repeats the PowerShell commands and explains the WSL key copy.

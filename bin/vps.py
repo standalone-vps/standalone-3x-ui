@@ -106,6 +106,7 @@ def plan(config: dict[str, str]) -> None:
     print(f"Public UDP: {config['HYSTERIA_PORT']} (Hysteria2)" if config["ENABLE_HYSTERIA"] == "yes" else "Hysteria2 disabled; no UDP allow")
     panel_scope = "public IPv4" if "0.0.0.0/0" in config["PANEL_ALLOWED_CIDRS"].split(",") else config["PANEL_ALLOWED_CIDRS"]
     print(f"Panel TCP {config['PANEL_PORT']} allowed from {panel_scope}")
+    print("IPv6: UFW blocks traffic except loopback; public services use IPv4")
     if ssh_port == "22":
         print("WARNING: Final SSH port 22 is an explicit exception to the source fleet policy.")
     print("Check provider firewall, public DNS, provider console and external client reachability before applying.")
@@ -238,7 +239,7 @@ def deploy(config: dict[str, str], *, check: bool, start: str = "network") -> No
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["plan", "keygen", "bootstrap", "deploy", "check-network", "verify-access", "verify", "update-page"])
+    parser.add_argument("action", choices=["plan", "keygen", "bootstrap", "deploy", "check-network", "verify-access", "verify", "update-page", "close-ipv6"])
     parser.add_argument("--env", type=Path, default=ROOT / ".env")
     parser.add_argument("--apply", action="store_true", help="Required for mutating actions")
     parser.add_argument("--from-stage", choices=STAGES, default="network", help="Resume after inspecting live state")
@@ -262,6 +263,14 @@ def main() -> int:
             require_key(config)
             ssh_probe(config, config["SSH_TARGET_PORT"])
             ansible(config, "verify.yml", {"connection_port": int(config["SSH_TARGET_PORT"])})
+        elif args.action == "close-ipv6":
+            if not args.apply:
+                raise ValueError("Closing IPv6 traffic changes the VPS; pass --apply")
+            require_key(config)
+            ssh_probe(config, config["SSH_TARGET_PORT"])
+            ansible(config, "ipv6-firewall.yml", {"connection_port": int(config["SSH_TARGET_PORT"]),
+                    "allow_ipv6_firewall_apply": True})
+            ssh_probe(config, config["SSH_TARGET_PORT"])
         elif args.action == "update-page":
             if not args.apply:
                 raise ValueError("Updating the page changes the VPS; pass --apply")

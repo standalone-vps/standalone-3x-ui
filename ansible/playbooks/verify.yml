@@ -17,6 +17,7 @@
         python3 - <<'PY'
         import json
         import subprocess
+        from pathlib import Path
 
         def output(*args):
             result = subprocess.run(args, capture_output=True, text=True, check=True, timeout=15)
@@ -36,6 +37,7 @@
             'tcp': {str(p): present(tcp, p) for p in [{{ target_ssh_port }}, {{ panel_port }}, {{ subscription_port }}, {{ vless_port }}]},
             'udp_hysteria': present(udp, {{ hysteria_port }}),
             'ufw_active': 'Status: active' in firewall,
+            'ipv6_blocked_by_ufw': 'IPV6=no' in Path('/etc/default/ufw').read_text().splitlines(),
             'panel_public_rule': any(str({{ panel_port }}) + '/tcp' in line and 'Anywhere' in line and 'ALLOW' in line for line in firewall.splitlines()),
             'ssh_key_only': all(item in sshd for item in ['passwordauthentication no', 'kbdinteractiveauthentication no', 'permitrootlogin no']),
             'services': active,
@@ -59,6 +61,7 @@
           - verify_runtime.tcp[vless_port | string] | bool
           - not (enable_hysteria | bool) or verify_runtime.udp_hysteria | bool
           - verify_runtime.ufw_active | bool
+          - verify_runtime.ipv6_blocked_by_ufw | bool
           - (verify_runtime.panel_public_rule | bool) == ('0.0.0.0/0' in panel_allowed_cidrs)
           - verify_runtime.ssh_key_only | bool
           - verify_runtime.services['x-ui.service'] | bool
