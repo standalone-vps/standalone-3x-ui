@@ -218,6 +218,17 @@ An inbound is a protocol and port that clients connect to.
 
 The installer checks services and ports. Only this external client test proves that a real client can connect.
 
+The public website is at `https://DOMAIN/` on port `443`. It shows a small API page. `https://DOMAIN/api/status` returns JSON. The VPS chooses its page from its machine ID. A new VPS gets its own page and node ID; rerunning the playbook keeps the same page. HTTPS traffic reaches Nginx through the VLESS/TLS fallback on local port `8000`. Port `8000` stays closed to the internet.
+
+To update the page on an existing VPS, run this **on your Linux computer**:
+
+```sh
+python3 bin/vps.py update-page --apply
+```
+
+This command updates only the fallback website. It does not recreate the panel or inbounds.
+
+
 ## If a command stops
 
 Do not repeat `deploy --apply` without checking the VPS state. The installer can leave completed stages in place. Check SSH on the last working port and run `python3 bin/vps.py verify` when access works. If SSH fails, use the provider recovery console.

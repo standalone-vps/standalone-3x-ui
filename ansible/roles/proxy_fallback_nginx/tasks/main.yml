@@ -13,14 +13,23 @@
     group: www-data
     mode: "0755"
 
-- name: Install fallback CDN placeholder page
+- name: Install VPS-specific API landing page
   ansible.builtin.template:
     src: index.html.j2
     dest: "{{ proxy_fallback_root }}/index.html"
     owner: www-data
     group: www-data
     mode: "0644"
+    backup: true
   notify: Restart nginx
+
+- name: Install API status response
+  ansible.builtin.template:
+    src: status.json.j2
+    dest: "{{ proxy_fallback_root }}/status.json"
+    owner: www-data
+    group: www-data
+    mode: "0644"
 
 - name: Disable default public nginx site
   ansible.builtin.file:
@@ -35,6 +44,7 @@
     owner: root
     group: root
     mode: "0644"
+    backup: true
   notify: Restart nginx
 
 - name: Validate nginx configuration
@@ -72,6 +82,23 @@
     return_content: false
     status_code: 200
   changed_when: false
+  when: not ansible_check_mode
+
+- name: Verify API status endpoint on loopback
+  ansible.builtin.uri:
+    url: "http://{{ proxy_fallback_listen_address }}:{{ proxy_fallback_listen_port }}/api/status"
+    status_code: 200
+    return_content: true
+  register: proxy_fallback_api_status
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: Require expected API status response
+  ansible.builtin.assert:
+    that:
+      - proxy_fallback_api_status.json.status == "ok"
+      - proxy_fallback_api_status.json.node == proxy_fallback_site_id
+      - proxy_fallback_api_status.json.service == proxy_fallback_site_variant.name
   when: not ansible_check_mode
 
 - name: Verify fallback listener is loopback-only

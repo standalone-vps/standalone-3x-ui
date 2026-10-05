@@ -238,7 +238,7 @@ def deploy(config: dict[str, str], *, check: bool, start: str = "network") -> No
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["plan", "keygen", "bootstrap", "deploy", "check-network", "verify-access", "verify"])
+    parser.add_argument("action", choices=["plan", "keygen", "bootstrap", "deploy", "check-network", "verify-access", "verify", "update-page"])
     parser.add_argument("--env", type=Path, default=ROOT / ".env")
     parser.add_argument("--apply", action="store_true", help="Required for mutating actions")
     parser.add_argument("--from-stage", choices=STAGES, default="network", help="Resume after inspecting live state")
@@ -262,6 +262,13 @@ def main() -> int:
             require_key(config)
             ssh_probe(config, config["SSH_TARGET_PORT"])
             ansible(config, "verify.yml", {"connection_port": int(config["SSH_TARGET_PORT"])})
+        elif args.action == "update-page":
+            if not args.apply:
+                raise ValueError("Updating the page changes the VPS; pass --apply")
+            require_key(config)
+            ssh_probe(config, config["SSH_TARGET_PORT"])
+            ansible(config, "proxy-fallback-nginx.yml", {"connection_port": int(config["SSH_TARGET_PORT"]),
+                    "allow_proxy_fallback_nginx": True})
         else:
             if args.action == "deploy" and not args.apply:
                 raise ValueError("Deployment changes the VPS; pass --apply after reviewing plan")
