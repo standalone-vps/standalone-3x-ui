@@ -1,0 +1,64 @@
+---
+- name: Read-only new VPS readiness
+  hosts: standalone
+  gather_facts: true
+  become: true
+  tasks:
+    - name: Require Ubuntu 24.04 and selected user
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution == 'Ubuntu'
+          - ansible_distribution_version is version('24.04', '>=')
+          - ansible_distribution_version is version('25.00', '<')
+          - ansible_user == ops_user
+          - ansible_play_hosts_all | length == 1
+
+    - name: Read effective SSH listeners
+      ansible.builtin.command: /usr/sbin/sshd -T
+      changed_when: false
+      register: readiness_sshd
+
+    - name: Read firewall state
+      ansible.builtin.command: ufw status verbose
+      changed_when: false
+      failed_when: false
+      register: readiness_ufw
+
+    - name: Check planned service port conflicts on this new VPS
+      ansible.builtin.shell: |
+        python3 - <<'PY'
+        import json
+        import re
+        import subprocess
+        tcp = subprocess.run(['ss', '-H', '-ltn'], capture_output=True, text=True, check=True).stdout
+        udp = subprocess.run(['ss', '-H', '-lun'], capture_output=True, text=True, check=True).stdout
+        def occupied(output, port):
+            return bool(re.search(r'(?<![0-9]):' + str(port) + r'\b', output))
+        print(json.dumps({
+            'target_ssh_conflict': {{ current_ssh_port }} != {{ target_ssh_port }} and occupied(tcp, {{ target_ssh_port }}),
+            'tcp_conflicts': [p for p in [80, {{ panel_port }}, {{ subscription_port }}, {{ vless_port }}] if occupied(tcp, p)],
+            'udp_conflict': {{ 'True' if enable_hysteria | bool else 'False' }} and occupied(udp, {{ hysteria_port }}),
+        }, sort_keys=True))
+        PY
+      args:
+        executable: /bin/bash
+      changed_when: false
+      register: readiness_ports_raw
+
+    - name: Require planned service ports available
+      ansible.builtin.assert:
+        that:
+          - not (readiness_ports.target_ssh_conflict | bool)
+          - readiness_ports.tcp_conflicts | length == 0
+          - not (readiness_ports.udp_conflict | bool)
+        fail_msg: A planned service port is already listening; inspect the host before deployment.
+      vars:
+        readiness_ports: "{{ readiness_ports_raw.stdout | from_json }}"
+
+    - name: Show sanitized readiness
+      ansible.builtin.debug:
+        msg:
+          distribution: "{{ ansible_distribution }} {{ ansible_distribution_version }}"
+          ssh_ports: "{{ readiness_sshd.stdout_lines | select('match', '^port ') | list }}"
+          ufw_active: "{{ 'Status: active' in readiness_ufw.stdout }}"
+          port_conflicts: "{{ readiness_ports_raw.stdout | from_json }}"

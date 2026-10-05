@@ -1,0 +1,548 @@
+---
+- name: Provision one 3x-ui bearer API token on an approved node
+  hosts: all
+  gather_facts: false
+  become: true
+  vars:
+    allow_x_ui_api_token_apply: false
+    x_ui_api_token_allowed_nodes:
+      - standalone
+    x_ui_api_token_name: standalone-3x-ui
+    x_ui_default_env_path: /etc/default/x-ui
+    x_ui_install_env_path: /etc/x-ui/install-result.env
+    x_ui_sqlite_database_path: /etc/x-ui/x-ui.db
+    x_ui_binary_path: /usr/local/x-ui/x-ui
+
+  pre_tasks:
+    - name: API token | Guard | Require explicit single-host limit and approval
+      ansible.builtin.assert:
+        that:
+          - ansible_limit is defined
+          - ansible_limit | length > 0
+          - ansible_play_hosts_all | length == 1
+          - allow_x_ui_api_token_apply | bool
+        fail_msg: >-
+          3x-ui API token provisioning is mutating. Run with an explicit single-host
+          --limit and -e allow_x_ui_api_token_apply=true after read-only preflight review.
+
+    - name: API token | Guard | Require approved token provisioning node
+      ansible.builtin.assert:
+        that:
+          - inventory_hostname in x_ui_api_token_allowed_nodes
+        fail_msg: >-
+          API token provisioning is currently approved only for
+          {{ x_ui_api_token_allowed_nodes | join(', ') }}. Override
+          x_ui_api_token_allowed_nodes only after separate review.
+
+    - name: API token | Guard | Require declared x-ui database backend
+      ansible.builtin.assert:
+        that:
+          - x_ui_db_backend is defined
+          - x_ui_db_backend in ['sqlite', 'sqlite3', 'postgres', 'postgresql']
+          - x_ui_api_token_name | length > 0
+          - x_ui_api_token_name | length <= 64
+        fail_msg: "Set per-host x_ui_db_backend to sqlite or postgres before token provisioning."
+
+    - name: API token | Guard | Show rollout and rollback notes
+      ansible.builtin.debug:
+        msg:
+          - "This playbook ensures XUI_API_TOKEN exists on one approved node and restarts x-ui only if token state changes."
+          - "Token values are generated on-host or reused from existing host files; token values are never printed."
+          - "It syncs {{ x_ui_default_env_path }} and {{ x_ui_install_env_path }}, then ensures a hashed api_tokens row named {{ x_ui_api_token_name }} exists."
+          - "Rollback: remove XUI_API_TOKEN from both files and restart x-ui after confirming no automation depends on it."
+
+  tasks:
+    - name: API token | Guard | Check x-ui binary exists
+      ansible.builtin.stat:
+        path: "{{ x_ui_binary_path }}"
+      register: x_ui_api_token_binary
+
+    - name: API token | Guard | Require x-ui binary
+      ansible.builtin.assert:
+        that:
+          - x_ui_api_token_binary.stat.exists
+        fail_msg: "x-ui binary not found at {{ x_ui_binary_path }}. Install 3x-ui before token provisioning."
+
+    - name: API token | Read-only | Collect sanitized x-ui token metadata with secret reads hidden
+      ansible.builtin.shell: |
+        python3 - <<'PY'
+        import json
+        import os
+        import re
+        import sqlite3
+        import subprocess
+
+        default_env_path = '{{ x_ui_default_env_path }}'
+        install_env_path = '{{ x_ui_install_env_path }}'
+        sqlite_database_path = '{{ x_ui_sqlite_database_path }}'
+        binary_path = '{{ x_ui_binary_path }}'
+
+        def read_env(path):
+            values = {}
+            if not os.path.exists(path):
+                return values
+            with open(path, encoding='utf-8', errors='replace') as handle:
+                for raw_line in handle:
+                    line = raw_line.strip()
+                    if not line or line.startswith('#') or '=' not in line:
+                        continue
+                    key, value = line.split('=', 1)
+                    values[key.strip()] = value.strip().strip('"').strip("'")
+            return values
+
+        default_env = read_env(default_env_path)
+        install_env = read_env(install_env_path)
+        env = {**default_env, **install_env}
+        detected_backend = (default_env.get('XUI_DB_TYPE') or install_env.get('XUI_DB_TYPE') or 'sqlite').strip().lower() or 'sqlite'
+        if detected_backend == 'sqlite3':
+            detected_backend = 'sqlite'
+        if detected_backend == 'postgresql':
+            detected_backend = 'postgres'
+
+        panel_port = env.get('XUI_PANEL_PORT') or ''
+        panel_port_source = 'env' if panel_port else 'unknown'
+        if detected_backend == 'sqlite' and os.path.exists(sqlite_database_path):
+            try:
+                conn = sqlite3.connect(sqlite_database_path)
+                cur = conn.cursor()
+                cur.execute("select name from sqlite_master where type='table'")
+                tables = {row[0] for row in cur.fetchall()}
+                if not panel_port and 'settings' in tables:
+                    cur.execute('select key, value from settings')
+                    settings = {key: value for key, value in cur.fetchall()}
+                    panel_port = settings.get('webPort') or settings.get('web_port') or ''
+                    if panel_port:
+                        panel_port_source = 'sqlite_settings'
+            except sqlite3.Error:
+                pass
+        if not panel_port:
+            result = subprocess.run([binary_path, 'setting', '-show', 'true'], text=True, capture_output=True, check=False, timeout=10)
+            combined = result.stdout + '\n' + result.stderr
+            port_match = re.search(r'(?im)^\s*port:\s*(\S+)', combined)
+            if port_match:
+                panel_port = port_match.group(1)
+                panel_port_source = 'x_ui_setting_show'
+
+        service_result = subprocess.run(['systemctl', '--no-pager', 'is-active', 'x-ui.service'], text=True, capture_output=True, check=False, timeout=10)
+        token_values = []
+        token_sources = []
+        for source, values in [('default_env', default_env), ('install_env', install_env)]:
+            token = values.get('XUI_API_TOKEN') or ''
+            if token:
+                token_sources.append(source)
+                token_values.append(token)
+        print(json.dumps({
+            'backend_declared': '{{ x_ui_db_backend }}',
+            'backend_detected': detected_backend,
+            'panel_port_detected': bool(panel_port),
+            'panel_port_source': panel_port_source,
+            'panel_port': panel_port if panel_port.isdigit() else '',
+            'service_active': service_result.stdout.strip() == 'active',
+            'token_conflict': len(set(token_values)) > 1,
+            'token_present_before': bool(token_values),
+            'token_sources_before': token_sources,
+        }, sort_keys=True))
+        PY
+      register: x_ui_api_token_metadata_raw
+      changed_when: false
+      no_log: true
+
+    - name: API token | Sanitized output | Store pre-change token metadata
+      ansible.builtin.set_fact:
+        x_ui_api_token_metadata: "{{ x_ui_api_token_metadata_raw.stdout | from_json }}"
+
+    - name: API token | Guard | Require safe runtime state
+      ansible.builtin.assert:
+        that:
+          - >-
+            (x_ui_api_token_metadata.backend_declared in ['sqlite', 'sqlite3'] and x_ui_api_token_metadata.backend_detected == 'sqlite') or
+            (x_ui_api_token_metadata.backend_declared in ['postgres', 'postgresql'] and x_ui_api_token_metadata.backend_detected == 'postgres')
+          - x_ui_api_token_metadata.service_active | bool
+          - not (x_ui_api_token_metadata.token_conflict | bool)
+        fail_msg: >-
+          Refusing token provisioning because runtime backend, service state, or existing token files are unsafe.
+          Detected backend={{ x_ui_api_token_metadata.backend_detected }}, service_active={{ x_ui_api_token_metadata.service_active }},
+          token_conflict={{ x_ui_api_token_metadata.token_conflict }}.
+
+    - name: API token | Sanitized output | Show pre-change token metadata
+      ansible.builtin.debug:
+        msg:
+          host: "{{ inventory_hostname }}"
+          backend_declared: "{{ x_ui_api_token_metadata.backend_declared }}"
+          backend_detected: "{{ x_ui_api_token_metadata.backend_detected }}"
+          service_active: "{{ x_ui_api_token_metadata.service_active }}"
+          panel_port_detected: "{{ x_ui_api_token_metadata.panel_port_detected }}"
+          panel_port_source: "{{ x_ui_api_token_metadata.panel_port_source }}"
+          token_present_before: "{{ x_ui_api_token_metadata.token_present_before }}"
+          token_sources_before: "{{ x_ui_api_token_metadata.token_sources_before }}"
+
+    - name: API token | Mutating | Ensure host-local bearer token exists in env files and x-ui DB
+      ansible.builtin.shell: |
+        python3 - <<'PY'
+        import hashlib
+        import json
+        import os
+        import secrets
+        import sqlite3
+        import subprocess
+        import tempfile
+        import time
+        import urllib.parse
+
+        env_paths = ['{{ x_ui_default_env_path }}', '{{ x_ui_install_env_path }}']
+        sqlite_database_path = '{{ x_ui_sqlite_database_path }}'
+        token_name = '{{ x_ui_api_token_name }}'
+
+        def read_env(path):
+            values = {}
+            if not os.path.exists(path):
+                return values
+            with open(path, encoding='utf-8', errors='replace') as handle:
+                for raw_line in handle:
+                    line = raw_line.strip()
+                    if not line or line.startswith('#') or '=' not in line:
+                        continue
+                    key, value = line.split('=', 1)
+                    values[key.strip()] = value.strip().strip('"').strip("'")
+            return values
+
+        def sql_quote(value):
+            return "'" + value.replace("'", "''") + "'"
+
+        def upsert_env(path, key, value):
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, mode=0o755, exist_ok=True)
+            lines = []
+            if os.path.exists(path):
+                with open(path, encoding='utf-8', errors='replace') as handle:
+                    lines = handle.readlines()
+            changed = False
+            found = False
+            new_lines = []
+            desired_line = f'{key}={value}\n'
+            for raw_line in lines:
+                stripped = raw_line.strip()
+                if stripped and not stripped.startswith('#') and '=' in stripped:
+                    current_key = stripped.split('=', 1)[0].strip()
+                    if current_key == key:
+                        found = True
+                        if raw_line != desired_line:
+                            changed = True
+                        new_lines.append(desired_line)
+                        continue
+                new_lines.append(raw_line)
+            if not found:
+                if new_lines and not new_lines[-1].endswith('\n'):
+                    new_lines[-1] = new_lines[-1] + '\n'
+                new_lines.append(desired_line)
+                changed = True
+            if changed:
+                fd, tmp_path = tempfile.mkstemp(prefix='.x-ui-env-', dir=parent or '.')
+                with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+                    handle.writelines(new_lines)
+                os.chmod(tmp_path, 0o600)
+                os.replace(tmp_path, path)
+            os.chmod(path, 0o600)
+            try:
+                os.chown(path, 0, 0)
+            except PermissionError:
+                pass
+            return changed
+
+        existing_tokens = []
+        token_sources_before = []
+        merged_env = {}
+        path_envs = []
+        for path in env_paths:
+            path_env = read_env(path)
+            path_envs.append(path_env)
+            merged_env.update(path_env)
+            token = path_env.get('XUI_API_TOKEN') or ''
+            if token:
+                existing_tokens.append(token)
+                token_sources_before.append(path)
+        unique_tokens = sorted(set(existing_tokens))
+        if len(unique_tokens) > 1:
+            raise SystemExit('conflicting token files')
+        generated = not unique_tokens
+        token = unique_tokens[0] if unique_tokens else secrets.token_urlsafe(48)
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        changed_paths = []
+        for path in env_paths:
+            if upsert_env(path, 'XUI_API_TOKEN', token):
+                changed_paths.append(path)
+
+        backend = (path_envs[0].get('XUI_DB_TYPE') or path_envs[1].get('XUI_DB_TYPE') or 'sqlite').strip().lower() or 'sqlite'
+        if backend == 'sqlite3':
+            backend = 'sqlite'
+        if backend == 'postgresql':
+            backend = 'postgres'
+
+        db_changed = False
+        db_token_present_after = False
+        if backend == 'sqlite':
+            conn = sqlite3.connect(sqlite_database_path)
+            cur = conn.cursor()
+            cur.execute("select name from sqlite_master where type='table' and name='api_tokens'")
+            if not cur.fetchone():
+                raise SystemExit('api_tokens table not found')
+            cur.execute('select token, enabled from api_tokens where name = ? limit 1', (token_name,))
+            row = cur.fetchone()
+            if row:
+                existing_hash, enabled = row
+                if existing_hash != token_hash:
+                    raise SystemExit('api token name exists with different hash')
+                if not bool(enabled):
+                    cur.execute('update api_tokens set enabled = 1 where name = ?', (token_name,))
+                    db_changed = True
+                db_token_present_after = True
+            else:
+                cur.execute(
+                    'insert into api_tokens (name, token, enabled, created_at) values (?, ?, ?, ?)',
+                    (token_name, token_hash, 1, int(time.time())),
+                )
+                db_changed = True
+                db_token_present_after = True
+            if db_changed:
+                conn.commit()
+            conn.close()
+        elif backend == 'postgres':
+            dsn = path_envs[0].get('XUI_DB_DSN') or path_envs[1].get('XUI_DB_DSN') or ''
+            if not dsn:
+                raise SystemExit('XUI_DB_DSN missing')
+            parsed = urllib.parse.urlparse(dsn)
+            pg_env = os.environ.copy()
+            pg_env.update({
+                'PGHOST': parsed.hostname or '',
+                'PGPORT': str(parsed.port or 5432),
+                'PGUSER': urllib.parse.unquote(parsed.username or ''),
+                'PGPASSWORD': urllib.parse.unquote(parsed.password or ''),
+                'PGDATABASE': (parsed.path or '/').lstrip('/'),
+                'PGCONNECT_TIMEOUT': '10',
+            })
+
+            def psql(sql):
+                return subprocess.run(
+                    ['psql', '-t', '-A', '-F', '|', '-v', 'ON_ERROR_STOP=1', '-c', sql],
+                    text=True,
+                    capture_output=True,
+                    env=pg_env,
+                    check=False,
+                    timeout=15,
+                )
+
+            query = 'select token, enabled::text from api_tokens where name = ' + sql_quote(token_name) + ' limit 1;'
+            result = psql(query)
+            if result.returncode != 0:
+                raise SystemExit('api token lookup failed')
+            line = result.stdout.strip().splitlines()[0] if result.stdout.strip() else ''
+            if line:
+                existing_hash, enabled_text = line.split('|', 1)
+                if existing_hash != token_hash:
+                    raise SystemExit('api token name exists with different hash')
+                if enabled_text.lower() not in ('t', 'true', '1'):
+                    update_result = psql('update api_tokens set enabled = true where name = ' + sql_quote(token_name) + ';')
+                    if update_result.returncode != 0:
+                        raise SystemExit('api token enable failed')
+                    db_changed = True
+                db_token_present_after = True
+            else:
+                insert_sql = (
+                    'insert into api_tokens (name, token, enabled, created_at) values ('
+                    + sql_quote(token_name) + ', '
+                    + sql_quote(token_hash) + ', true, '
+                    + str(int(time.time())) + ');'
+                )
+                insert_result = psql(insert_sql)
+                if insert_result.returncode != 0:
+                    raise SystemExit('api token insert failed')
+                db_changed = True
+                db_token_present_after = True
+        else:
+            raise SystemExit('unsupported backend')
+
+        token_sources_after = []
+        for path in env_paths:
+            if read_env(path).get('XUI_API_TOKEN'):
+                token_sources_after.append(path)
+        print(json.dumps({
+            'changed': bool(changed_paths) or db_changed,
+            'db_backend': backend,
+            'db_changed': db_changed,
+            'db_token_present_after': db_token_present_after,
+            'env_changed': bool(changed_paths),
+            'changed_paths': changed_paths,
+            'generated': generated,
+            'token_present_after': len(token_sources_after) == len(env_paths),
+            'token_sources_before_count': len(token_sources_before),
+            'token_sources_after_count': len(token_sources_after),
+        }, sort_keys=True))
+        PY
+      register: x_ui_api_token_apply_raw
+      changed_when: (x_ui_api_token_apply_raw.stdout | from_json).changed | bool
+      no_log: true
+
+    - name: API token | Sanitized output | Store token apply result
+      ansible.builtin.set_fact:
+        x_ui_api_token_apply: "{{ x_ui_api_token_apply_raw.stdout | from_json }}"
+
+    - name: API token | Guard | Require apply backend to match detected backend
+      ansible.builtin.assert:
+        that:
+          - x_ui_api_token_apply.db_backend == x_ui_api_token_metadata.backend_detected
+        fail_msg: >-
+          Token provisioning backend mismatch: detected={{ x_ui_api_token_metadata.backend_detected }},
+          applied={{ x_ui_api_token_apply.db_backend }}. Stop and inspect host env files before continuing.
+
+    - name: API token | Mutating | Restart x-ui after token change
+      ansible.builtin.systemd_service:
+        name: x-ui.service
+        enabled: true
+        state: restarted
+      when: x_ui_api_token_apply.changed | bool
+
+    - name: API token | Read-only | Wait for x-ui panel port after restart
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: "{{ x_ui_api_token_metadata.panel_port | int }}"
+        timeout: 30
+      when:
+        - x_ui_api_token_apply.changed | bool
+        - x_ui_api_token_metadata.panel_port_detected | bool
+        - x_ui_api_token_metadata.panel_port | string | length > 0
+
+    - name: API token | Read-only | Verify token presence, DB row and service state with secret reads hidden
+      ansible.builtin.shell: |
+        python3 - <<'PY'
+        import hashlib
+        import json
+        import os
+        import sqlite3
+        import subprocess
+        import urllib.parse
+
+        paths = {
+            'default_env': '{{ x_ui_default_env_path }}',
+            'install_env': '{{ x_ui_install_env_path }}',
+        }
+        sqlite_database_path = '{{ x_ui_sqlite_database_path }}'
+        token_name = '{{ x_ui_api_token_name }}'
+
+        def read_env(path):
+            values = {}
+            if not os.path.exists(path):
+                return values
+            with open(path, encoding='utf-8', errors='replace') as handle:
+                for raw_line in handle:
+                    line = raw_line.strip()
+                    if not line or line.startswith('#') or '=' not in line:
+                        continue
+                    key, value = line.split('=', 1)
+                    values[key.strip()] = value.strip().strip('"').strip("'")
+            return values
+
+        service_result = subprocess.run(['systemctl', '--no-pager', 'is-active', 'x-ui.service'], text=True, capture_output=True, check=False, timeout=10)
+        token_sources = []
+        token_values = []
+        merged_env = {}
+        path_envs = []
+        for source, path in paths.items():
+            path_env = read_env(path)
+            path_envs.append(path_env)
+            merged_env.update(path_env)
+            token = path_env.get('XUI_API_TOKEN') or ''
+            if token:
+                token_sources.append(source)
+                token_values.append(token)
+        db_token_present = False
+        db_token_enabled = False
+        if len(set(token_values)) == 1 and token_values:
+            token_hash = hashlib.sha256(token_values[0].encode()).hexdigest()
+            backend = (path_envs[0].get('XUI_DB_TYPE') or path_envs[1].get('XUI_DB_TYPE') or 'sqlite').strip().lower() or 'sqlite'
+            if backend == 'sqlite3':
+                backend = 'sqlite'
+            if backend == 'postgresql':
+                backend = 'postgres'
+            if backend == 'sqlite':
+                conn = sqlite3.connect(sqlite_database_path)
+                cur = conn.cursor()
+                cur.execute('select token, enabled from api_tokens where name = ? limit 1', (token_name,))
+                row = cur.fetchone()
+                conn.close()
+                if row:
+                    db_token_present = row[0] == token_hash
+                    db_token_enabled = bool(row[1])
+            elif backend == 'postgres':
+                dsn = path_envs[0].get('XUI_DB_DSN') or path_envs[1].get('XUI_DB_DSN') or ''
+                parsed = urllib.parse.urlparse(dsn)
+                pg_env = os.environ.copy()
+                pg_env.update({
+                    'PGHOST': parsed.hostname or '',
+                    'PGPORT': str(parsed.port or 5432),
+                    'PGUSER': urllib.parse.unquote(parsed.username or ''),
+                    'PGPASSWORD': urllib.parse.unquote(parsed.password or ''),
+                    'PGDATABASE': (parsed.path or '/').lstrip('/'),
+                    'PGCONNECT_TIMEOUT': '10',
+                })
+                safe_name = "'" + token_name.replace("'", "''") + "'"
+                sql = 'select token, enabled::text from api_tokens where name = ' + safe_name + ' limit 1;'
+                result = subprocess.run(['psql', '-t', '-A', '-F', '|', '-v', 'ON_ERROR_STOP=1', '-c', sql], text=True, capture_output=True, env=pg_env, check=False, timeout=15)
+                line = result.stdout.strip().splitlines()[0] if result.returncode == 0 and result.stdout.strip() else ''
+                if line:
+                    existing_hash, enabled_text = line.split('|', 1)
+                    db_token_present = existing_hash == token_hash
+                    db_token_enabled = enabled_text.lower() in ('t', 'true', '1')
+        print(json.dumps({
+            'db_backend_after': backend if len(set(token_values)) == 1 and token_values else '',
+            'db_token_enabled_after': db_token_enabled,
+            'db_token_present_after': db_token_present,
+            'service_active_after': service_result.stdout.strip() == 'active',
+            'token_conflict_after': len(set(token_values)) > 1,
+            'token_present_after': len(token_sources) == len(paths),
+            'token_sources_after': token_sources,
+        }, sort_keys=True))
+        PY
+      register: x_ui_api_token_verify_raw
+      changed_when: false
+      no_log: true
+
+    - name: API token | Sanitized output | Store token verification result
+      ansible.builtin.set_fact:
+        x_ui_api_token_verify: "{{ x_ui_api_token_verify_raw.stdout | from_json }}"
+
+    - name: API token | Guard | Require token provisioning success
+      ansible.builtin.assert:
+        that:
+          - x_ui_api_token_verify.service_active_after | bool
+          - x_ui_api_token_verify.token_present_after | bool
+          - x_ui_api_token_verify.db_backend_after == x_ui_api_token_metadata.backend_detected
+          - x_ui_api_token_verify.db_token_present_after | bool
+          - x_ui_api_token_verify.db_token_enabled_after | bool
+          - not (x_ui_api_token_verify.token_conflict_after | bool)
+        fail_msg: >-
+          Token provisioning did not reach a safe final state:
+          service_active_after={{ x_ui_api_token_verify.service_active_after }},
+          token_present_after={{ x_ui_api_token_verify.token_present_after }},
+          db_backend_after={{ x_ui_api_token_verify.db_backend_after }},
+          db_token_present_after={{ x_ui_api_token_verify.db_token_present_after }},
+          db_token_enabled_after={{ x_ui_api_token_verify.db_token_enabled_after }},
+          token_conflict_after={{ x_ui_api_token_verify.token_conflict_after }}.
+
+    - name: API token | Sanitized output | Show final token provisioning result
+      ansible.builtin.debug:
+        msg:
+          host: "{{ inventory_hostname }}"
+          changed: "{{ x_ui_api_token_apply.changed }}"
+          db_backend: "{{ x_ui_api_token_apply.db_backend }}"
+          db_backend_after: "{{ x_ui_api_token_verify.db_backend_after }}"
+          db_changed: "{{ x_ui_api_token_apply.db_changed }}"
+          db_token_present_after: "{{ x_ui_api_token_verify.db_token_present_after }}"
+          db_token_enabled_after: "{{ x_ui_api_token_verify.db_token_enabled_after }}"
+          env_changed: "{{ x_ui_api_token_apply.env_changed }}"
+          generated: "{{ x_ui_api_token_apply.generated }}"
+          token_present_before: "{{ x_ui_api_token_metadata.token_present_before }}"
+          token_sources_before: "{{ x_ui_api_token_metadata.token_sources_before }}"
+          token_present_after: "{{ x_ui_api_token_verify.token_present_after }}"
+          token_sources_after: "{{ x_ui_api_token_verify.token_sources_after }}"
+          service_active_after: "{{ x_ui_api_token_verify.service_active_after }}"

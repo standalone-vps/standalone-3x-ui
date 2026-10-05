@@ -1,0 +1,374 @@
+---
+- name: Configure one 3x-ui subscription controller port
+  hosts: all
+  gather_facts: true
+  become: true
+  vars:
+    allow_x_ui_subscription_port_apply: false
+    x_ui_subscription_controller_alias: ""
+    x_ui_subscription_port: 38443
+    x_ui_default_env_path: /etc/default/x-ui
+    x_ui_install_env_path: /etc/x-ui/install-result.env
+    x_ui_sqlite_database_path: /etc/x-ui/x-ui.db
+    x_ui_backup_dir: /root
+
+  pre_tasks:
+    - name: Subscription controller | Guard | Require explicit single-host limit and approval
+      ansible.builtin.assert:
+        that:
+          - ansible_limit is defined
+          - ansible_limit | length > 0
+          - ansible_play_hosts_all | length == 1
+          - allow_x_ui_subscription_port_apply | bool
+          - x_ui_subscription_controller_alias | length > 0
+          - inventory_hostname == x_ui_subscription_controller_alias
+        fail_msg: >-
+          Subscription controller port configuration is mutating. Run with one explicit
+          --limit, -e allow_x_ui_subscription_port_apply=true, and
+          -e x_ui_subscription_controller_alias=<same-host>.
+
+    - name: Subscription controller | Guard | Require declared backend and valid public port
+      ansible.builtin.assert:
+        that:
+          - x_ui_db_backend is defined
+          - x_ui_db_backend in ['sqlite', 'sqlite3', 'postgres', 'postgresql']
+          - x_ui_subscription_port | int > 0
+          - x_ui_subscription_port | int <= 65535
+        fail_msg: "Set per-host x_ui_db_backend and a valid x_ui_subscription_port before mutation."
+
+    - name: Subscription controller | Guard | Show rollout and rollback notes
+      ansible.builtin.debug:
+        msg:
+          - "This playbook enables the 3x-ui subscription endpoint on {{ inventory_hostname }} port {{ x_ui_subscription_port }} and opens UFW for TCP {{ x_ui_subscription_port }}."
+          - "It backs up SQLite with a DB copy or PostgreSQL with pg_dump before changing settings."
+          - "Rollback: restore the printed backup, or rerun this playbook with the previous subPort after review, then restart x-ui and remove the UFW allow rule if no longer needed."
+          - "DB DSNs, API tokens, panel credentials and raw settings values are hidden with no_log."
+
+  tasks:
+    - name: Subscription controller | Read-only | Collect x-ui backend and current subscription settings
+      ansible.builtin.shell: |
+        python3 - <<'PY'
+        import json
+        import os
+        import sqlite3
+        import subprocess
+        import urllib.parse
+
+        def read_env(path):
+            values = {}
+            if not os.path.exists(path):
+                return values
+            with open(path, encoding='utf-8', errors='replace') as handle:
+                for raw_line in handle:
+                    line = raw_line.strip()
+                    if line and not line.startswith('#') and '=' in line:
+                        key, value = line.split('=', 1)
+                        values[key.strip()] = value.strip().strip('"').strip("'")
+            return values
+
+        default_env = read_env('{{ x_ui_default_env_path }}')
+        install_env = read_env('{{ x_ui_install_env_path }}')
+        env = {**default_env, **install_env}
+        backend = (default_env.get('XUI_DB_TYPE') or install_env.get('XUI_DB_TYPE') or 'sqlite').strip().lower() or 'sqlite'
+        if backend == 'sqlite3':
+            backend = 'sqlite'
+        if backend == 'postgresql':
+            backend = 'postgres'
+
+        current = {'subEnable': None, 'subPort': None}
+        if backend == 'sqlite':
+            conn = sqlite3.connect('{{ x_ui_sqlite_database_path }}')
+            cur = conn.cursor()
+            cur.execute("select key, value from settings where key in ('subEnable', 'subPort')")
+            current.update({key: value for key, value in cur.fetchall()})
+            conn.close()
+        elif backend == 'postgres':
+            dsn = env.get('XUI_DB_DSN') or ''
+            if not dsn:
+                raise SystemExit('XUI_DB_DSN missing')
+            parsed = urllib.parse.urlparse(dsn)
+            pg_env = os.environ.copy()
+            pg_env.update({
+                'PGHOST': parsed.hostname or '',
+                'PGPORT': str(parsed.port or 5432),
+                'PGUSER': urllib.parse.unquote(parsed.username or ''),
+                'PGPASSWORD': urllib.parse.unquote(parsed.password or ''),
+                'PGDATABASE': (parsed.path or '/').lstrip('/'),
+                'PGCONNECT_TIMEOUT': '10',
+            })
+            result = subprocess.run(
+                ['psql', '-t', '-A', '-F', '|', '-v', 'ON_ERROR_STOP=1', '-c', "select key, value from settings where key in ('subEnable', 'subPort') order by key;"],
+                text=True,
+                capture_output=True,
+                env=pg_env,
+                check=False,
+                timeout=15,
+            )
+            if result.returncode != 0:
+                raise SystemExit('settings query failed')
+            for line in result.stdout.strip().splitlines():
+                if '|' in line:
+                    key, value = line.split('|', 1)
+                    current[key] = value
+        else:
+            raise SystemExit('unsupported backend')
+
+        service_result = subprocess.run(['systemctl', '--no-pager', 'is-active', 'x-ui.service'], text=True, capture_output=True, check=False, timeout=10)
+        print(json.dumps({
+            'backend_declared': '{{ x_ui_db_backend }}',
+            'backend_detected': backend,
+            'service_active': service_result.stdout.strip() == 'active',
+            'sub_enable_before': current.get('subEnable'),
+            'sub_port_before': current.get('subPort'),
+        }, sort_keys=True))
+        PY
+      args:
+        executable: /bin/bash
+      register: x_ui_subscription_metadata_raw
+      changed_when: false
+      no_log: true
+
+    - name: Subscription controller | Sanitized output | Store metadata
+      ansible.builtin.set_fact:
+        x_ui_subscription_metadata: "{{ x_ui_subscription_metadata_raw.stdout | from_json }}"
+
+    - name: Subscription controller | Guard | Require safe runtime state
+      ansible.builtin.assert:
+        that:
+          - >-
+            (x_ui_subscription_metadata.backend_declared in ['sqlite', 'sqlite3'] and x_ui_subscription_metadata.backend_detected == 'sqlite') or
+            (x_ui_subscription_metadata.backend_declared in ['postgres', 'postgresql'] and x_ui_subscription_metadata.backend_detected == 'postgres')
+          - x_ui_subscription_metadata.service_active | bool
+        fail_msg: >-
+          Refusing subscription mutation because backend or service state is unsafe.
+          backend_detected={{ x_ui_subscription_metadata.backend_detected }}, service_active={{ x_ui_subscription_metadata.service_active }}.
+
+    - name: Subscription controller | Sanitized output | Show pre-change settings
+      ansible.builtin.debug:
+        msg:
+          host: "{{ inventory_hostname }}"
+          backend_detected: "{{ x_ui_subscription_metadata.backend_detected }}"
+          sub_enable_before: "{{ x_ui_subscription_metadata.sub_enable_before }}"
+          sub_port_before: "{{ x_ui_subscription_metadata.sub_port_before }}"
+          desired_sub_port: "{{ x_ui_subscription_port | int }}"
+
+    - name: Subscription controller | Mutating | Back up SQLite database before settings change
+      ansible.builtin.copy:
+        src: "{{ x_ui_sqlite_database_path }}"
+        dest: "{{ x_ui_backup_dir }}/x-ui-backup-before-subscription-port-{{ ansible_date_time.iso8601_basic_short }}.db"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0600"
+      register: x_ui_subscription_sqlite_backup
+      when: x_ui_subscription_metadata.backend_detected == 'sqlite'
+
+    - name: Subscription controller | Mutating | Back up PostgreSQL database before settings change
+      ansible.builtin.shell: |
+        python3 - <<'PY'
+        import os
+        import subprocess
+        import urllib.parse
+
+        env_values = {}
+        for path in ['{{ x_ui_default_env_path }}', '{{ x_ui_install_env_path }}']:
+            if os.path.exists(path):
+                with open(path, encoding='utf-8', errors='replace') as handle:
+                    for raw_line in handle:
+                        line = raw_line.strip()
+                        if line and not line.startswith('#') and '=' in line:
+                            key, value = line.split('=', 1)
+                            env_values[key.strip()] = value.strip().strip('"').strip("'")
+        dsn = env_values.get('XUI_DB_DSN') or ''
+        if not dsn:
+            raise SystemExit('XUI_DB_DSN missing')
+        parsed = urllib.parse.urlparse(dsn)
+        pg_env = os.environ.copy()
+        pg_env.update({
+            'PGHOST': parsed.hostname or '',
+            'PGPORT': str(parsed.port or 5432),
+            'PGUSER': urllib.parse.unquote(parsed.username or ''),
+            'PGPASSWORD': urllib.parse.unquote(parsed.password or ''),
+            'PGDATABASE': (parsed.path or '/').lstrip('/'),
+            'PGCONNECT_TIMEOUT': '10',
+        })
+        backup_path = '{{ x_ui_backup_dir }}/x-ui-postgres-backup-before-subscription-port-{{ ansible_date_time.iso8601_basic_short }}.sql'
+        with open(backup_path, 'w', encoding='utf-8') as handle:
+            result = subprocess.run(['pg_dump', '--no-owner', '--no-privileges'], text=True, stdout=handle, stderr=subprocess.PIPE, env=pg_env, check=False, timeout=60)
+        os.chmod(backup_path, 0o600)
+        if result.returncode != 0:
+            raise SystemExit('pg_dump failed')
+        print(backup_path)
+        PY
+      args:
+        executable: /bin/bash
+      register: x_ui_subscription_postgres_backup
+      changed_when: true
+      no_log: true
+      when: x_ui_subscription_metadata.backend_detected == 'postgres'
+
+    - name: Subscription controller | Sanitized output | Show backup status
+      ansible.builtin.debug:
+        msg:
+          host: "{{ inventory_hostname }}"
+          backend: "{{ x_ui_subscription_metadata.backend_detected }}"
+          backup_created: true
+          backup_type: "{{ 'postgres_pg_dump' if x_ui_subscription_metadata.backend_detected == 'postgres' else 'sqlite_copy' }}"
+
+    - name: Subscription controller | Mutating | Set subscription settings in x-ui database
+      ansible.builtin.shell: |
+        python3 - <<'PY'
+        import json
+        import os
+        import sqlite3
+        import subprocess
+        import urllib.parse
+
+        desired_port = str({{ x_ui_subscription_port | int }})
+        backend = '{{ x_ui_subscription_metadata.backend_detected }}'
+
+        def read_env(path):
+            values = {}
+            if not os.path.exists(path):
+                return values
+            with open(path, encoding='utf-8', errors='replace') as handle:
+                for raw_line in handle:
+                    line = raw_line.strip()
+                    if line and not line.startswith('#') and '=' in line:
+                        key, value = line.split('=', 1)
+                        values[key.strip()] = value.strip().strip('"').strip("'")
+            return values
+
+        changed = False
+        if backend == 'sqlite':
+            conn = sqlite3.connect('{{ x_ui_sqlite_database_path }}')
+            cur = conn.cursor()
+            for key, value in [('subEnable', 'true'), ('subPort', desired_port)]:
+                cur.execute('select value from settings where key = ? limit 1', (key,))
+                row = cur.fetchone()
+                if row:
+                    if row[0] != value:
+                        cur.execute('update settings set value = ? where key = ?', (value, key))
+                        changed = True
+                else:
+                    cur.execute('insert into settings (key, value) values (?, ?)', (key, value))
+                    changed = True
+            if changed:
+                conn.commit()
+            conn.close()
+        elif backend == 'postgres':
+            env_values = {}
+            for path in ['{{ x_ui_default_env_path }}', '{{ x_ui_install_env_path }}']:
+                env_values.update(read_env(path))
+            dsn = env_values.get('XUI_DB_DSN') or ''
+            if not dsn:
+                raise SystemExit('XUI_DB_DSN missing')
+            parsed = urllib.parse.urlparse(dsn)
+            pg_env = os.environ.copy()
+            pg_env.update({
+                'PGHOST': parsed.hostname or '',
+                'PGPORT': str(parsed.port or 5432),
+                'PGUSER': urllib.parse.unquote(parsed.username or ''),
+                'PGPASSWORD': urllib.parse.unquote(parsed.password or ''),
+                'PGDATABASE': (parsed.path or '/').lstrip('/'),
+                'PGCONNECT_TIMEOUT': '10',
+            })
+
+            def sql_quote(value):
+                return "'" + value.replace("'", "''") + "'"
+
+            statements = []
+            for key, value in [('subEnable', 'true'), ('subPort', desired_port)]:
+                quoted_key = sql_quote(key)
+                quoted_value = sql_quote(value)
+                statements.append("update settings set value = " + quoted_value + " where key = " + quoted_key + " and value is distinct from " + quoted_value + ";")
+                statements.append("insert into settings (key, value) select " + quoted_key + ", " + quoted_value + " where not exists (select 1 from settings where key = " + quoted_key + ");")
+            result = subprocess.run(
+                ['psql', '-t', '-A', '-v', 'ON_ERROR_STOP=1', '-c', '\n'.join(statements)],
+                text=True,
+                capture_output=True,
+                env=pg_env,
+                check=False,
+                timeout=15,
+            )
+            if result.returncode != 0:
+                raise SystemExit('settings update failed')
+            changed = 'UPDATE 1' in result.stdout or 'INSERT 0 1' in result.stdout
+        else:
+            raise SystemExit('unsupported backend')
+
+        print(json.dumps({'changed': changed, 'sub_enable_after': 'true', 'sub_port_after': desired_port}, sort_keys=True))
+        PY
+      args:
+        executable: /bin/bash
+      register: x_ui_subscription_apply_raw
+      changed_when: (x_ui_subscription_apply_raw.stdout | from_json).changed | bool
+      no_log: true
+
+    - name: Subscription controller | Sanitized output | Store apply result
+      ansible.builtin.set_fact:
+        x_ui_subscription_apply: "{{ x_ui_subscription_apply_raw.stdout | from_json }}"
+
+    - name: Subscription controller | Mutating | Restart x-ui after subscription settings change
+      ansible.builtin.systemd_service:
+        name: x-ui.service
+        enabled: true
+        state: restarted
+
+    - name: Subscription controller | Read-only | Wait for subscription port locally
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: "{{ x_ui_subscription_port | int }}"
+        timeout: 30
+
+    - name: Subscription controller | UFW | Allow public subscription TCP port
+      ansible.builtin.command: "ufw allow proto tcp from 0.0.0.0/0 to any port {{ x_ui_subscription_port | int }} comment 'fleet subscription controller public'"
+      register: x_ui_subscription_ufw_allow
+      changed_when: "'rule added' in x_ui_subscription_ufw_allow.stdout | lower or 'rules updated' in x_ui_subscription_ufw_allow.stdout | lower"
+
+    - name: Subscription controller | Read-only | Verify listener and UFW status
+      ansible.builtin.shell: |
+        python3 - <<'PY'
+        import json
+        import subprocess
+        port = '{{ x_ui_subscription_port | int }}'
+        ss_result = subprocess.run(['ss', '-ltn'], text=True, capture_output=True, check=False, timeout=10)
+        ufw_result = subprocess.run(['ufw', 'status', 'verbose'], text=True, capture_output=True, check=False, timeout=10)
+        print(json.dumps({
+            'listener_present': (':' + port) in ss_result.stdout,
+            'ufw_port_present': (port + '/tcp') in ufw_result.stdout,
+            'x_ui_active': subprocess.run(['systemctl', '--no-pager', 'is-active', 'x-ui.service'], text=True, capture_output=True, check=False, timeout=10).stdout.strip() == 'active',
+        }, sort_keys=True))
+        PY
+      args:
+        executable: /bin/bash
+      register: x_ui_subscription_verify_raw
+      changed_when: false
+
+    - name: Subscription controller | Sanitized output | Store verification result
+      ansible.builtin.set_fact:
+        x_ui_subscription_verify: "{{ x_ui_subscription_verify_raw.stdout | from_json }}"
+
+    - name: Subscription controller | Guard | Require subscription port final state
+      ansible.builtin.assert:
+        that:
+          - x_ui_subscription_verify.listener_present | bool
+          - x_ui_subscription_verify.ufw_port_present | bool
+          - x_ui_subscription_verify.x_ui_active | bool
+        fail_msg: >-
+          Subscription controller port did not reach desired state:
+          listener_present={{ x_ui_subscription_verify.listener_present }},
+          ufw_port_present={{ x_ui_subscription_verify.ufw_port_present }},
+          x_ui_active={{ x_ui_subscription_verify.x_ui_active }}.
+
+    - name: Subscription controller | Sanitized output | Show final state
+      ansible.builtin.debug:
+        msg:
+          host: "{{ inventory_hostname }}"
+          sub_port_before: "{{ x_ui_subscription_metadata.sub_port_before }}"
+          sub_port_after: "{{ x_ui_subscription_apply.sub_port_after }}"
+          sub_enable_after: "{{ x_ui_subscription_apply.sub_enable_after }}"
+          settings_changed: "{{ x_ui_subscription_apply.changed }}"
+          listener_present: "{{ x_ui_subscription_verify.listener_present }}"
+          ufw_port_present: "{{ x_ui_subscription_verify.ufw_port_present }}"
+          x_ui_active: "{{ x_ui_subscription_verify.x_ui_active }}"

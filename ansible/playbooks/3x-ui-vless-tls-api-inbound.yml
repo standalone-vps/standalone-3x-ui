@@ -1,0 +1,418 @@
+---
+- name: Create one 3x-ui VLESS TLS inbound through bearer API
+  hosts: all
+  gather_facts: true
+  become: true
+  vars:
+    allow_x_ui_vless_tls_api_inbound_apply: false
+    x_ui_vless_tls_api_allowed_nodes:
+      - standalone
+    x_ui_domain: "{{ public_hostname | default('') }}"
+    x_ui_inbound_remark: "{{ inventory_hostname }}_vless_tls_443"
+    x_ui_inbound_port: 443
+    x_ui_fallback_dest: 8000
+    x_ui_default_env_path: /etc/default/x-ui
+    x_ui_install_env_path: /etc/x-ui/install-result.env
+    x_ui_sqlite_database_path: /etc/x-ui/x-ui.db
+    x_ui_binary_path: /usr/local/x-ui/x-ui
+    x_ui_backup_dir: /root
+    x_ui_cert_dir: "/root/cert/{{ x_ui_domain }}"
+    x_ui_cert_fullchain_path: "{{ x_ui_cert_dir }}/fullchain.pem"
+    x_ui_cert_key_path: "{{ x_ui_cert_dir }}/privkey.pem"
+    x_ui_vless_tls_status_path: /root/x-ui-vless-tls-api-inbound-status.json
+
+  pre_tasks:
+    - name: VLESS TLS API | Guard | Require explicit single-host limit and approval
+      ansible.builtin.assert:
+        that:
+          - ansible_limit is defined
+          - ansible_limit | length > 0
+          - ansible_play_hosts_all | length == 1
+          - allow_x_ui_vless_tls_api_inbound_apply | bool
+        fail_msg: >-
+          VLESS TLS inbound creation is mutating. Run with an explicit single-host
+          --limit and -e allow_x_ui_vless_tls_api_inbound_apply=true after preflight review.
+
+    - name: VLESS TLS API | Guard | Require approved node
+      ansible.builtin.assert:
+        that:
+          - inventory_hostname in x_ui_vless_tls_api_allowed_nodes
+        fail_msg: >-
+          VLESS TLS API inbound creation is currently approved only for
+          {{ x_ui_vless_tls_api_allowed_nodes | join(', ') }}.
+
+    - name: VLESS TLS API | Guard | Require declared backend and domain
+      ansible.builtin.assert:
+        that:
+          - x_ui_db_backend is defined
+          - x_ui_db_backend in ['sqlite', 'sqlite3', 'postgres', 'postgresql']
+          - x_ui_domain | length > 0
+          - x_ui_domain is match('^[A-Za-z0-9.-]+$')
+          - x_ui_inbound_port | int > 0
+          - x_ui_inbound_port | int <= 65535
+        fail_msg: "Set x_ui_db_backend, x_ui_domain and a valid x_ui_inbound_port before VLESS TLS creation."
+
+    - name: VLESS TLS API | Guard | Show rollout and rollback notes
+      ansible.builtin.debug:
+        msg:
+          - "This playbook creates one VLESS TLS inbound on TCP {{ x_ui_inbound_port }} with fallback dest {{ x_ui_fallback_dest }}."
+          - "It backs up SQLite with a DB copy or PostgreSQL with pg_dump before creation."
+          - "Rollback: remove the created inbound through the panel/API or restore the printed backup after review."
+          - "Tokens, DB DSNs, panel URLs, cert private keys and raw API payloads are hidden with no_log."
+
+  tasks:
+    - name: VLESS TLS API | Read-only | Check certificate files exist
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ x_ui_cert_fullchain_path }}"
+        - "{{ x_ui_cert_key_path }}"
+      register: x_ui_vless_tls_cert_files
+      no_log: true
+
+    - name: VLESS TLS API | Guard | Require certificate files
+      ansible.builtin.assert:
+        that:
+          - x_ui_vless_tls_cert_files.results | map(attribute='stat.exists') | min
+        fail_msg: "TLS certificate files are missing under the expected certificate directory. Run cert setup first."
+
+    - name: VLESS TLS API | Read-only | Collect local panel metadata with secret reads hidden
+      ansible.builtin.shell: |
+        python3 - <<'PY'
+        import json
+        import os
+        import re
+        import subprocess
+
+        def read_env(path):
+            values = {}
+            if not os.path.exists(path):
+                return values
+            with open(path, encoding='utf-8', errors='replace') as handle:
+                for raw_line in handle:
+                    line = raw_line.strip()
+                    if line and not line.startswith('#') and '=' in line:
+                        key, value = line.split('=', 1)
+                        values[key.strip()] = value.strip().strip('"').strip("'")
+            return values
+
+        default_env = read_env('{{ x_ui_default_env_path }}')
+        install_env = read_env('{{ x_ui_install_env_path }}')
+        env = {**default_env, **install_env}
+        backend = (default_env.get('XUI_DB_TYPE') or install_env.get('XUI_DB_TYPE') or 'sqlite').strip().lower() or 'sqlite'
+        if backend == 'sqlite3':
+            backend = 'sqlite'
+        if backend == 'postgresql':
+            backend = 'postgres'
+        panel_port = env.get('XUI_PANEL_PORT') or ''
+        base_path = env.get('XUI_WEB_BASE_PATH') or '/'
+        if not panel_port:
+            result = subprocess.run(['{{ x_ui_binary_path }}', 'setting', '-show', 'true'], text=True, capture_output=True, check=False, timeout=10)
+            combined = result.stdout + '\n' + result.stderr
+            port_match = re.search(r'(?im)^\s*port:\s*(\S+)', combined)
+            base_match = re.search(r'(?im)^\s*webBasePath:\s*(\S+)', combined)
+            if port_match:
+                panel_port = port_match.group(1)
+            if base_match and base_path == '/':
+                base_path = base_match.group(1)
+        if not base_path.startswith('/'):
+            base_path = '/' + base_path
+        if not base_path.endswith('/'):
+            base_path += '/'
+        service_result = subprocess.run(['systemctl', '--no-pager', 'is-active', 'x-ui.service'], text=True, capture_output=True, check=False, timeout=10)
+        print(json.dumps({
+            'api_token': env.get('XUI_API_TOKEN') or '',
+            'api_token_present': bool(env.get('XUI_API_TOKEN')),
+            'backend_declared': '{{ x_ui_db_backend }}',
+            'backend_detected': backend,
+            'base_path': base_path,
+            'panel_port': int(panel_port) if str(panel_port).isdigit() else 0,
+            'service_active': service_result.stdout.strip() == 'active',
+        }, sort_keys=True))
+        PY
+      args:
+        executable: /bin/bash
+      register: x_ui_vless_tls_metadata_raw
+      changed_when: false
+      no_log: true
+
+    - name: VLESS TLS API | Sanitized output | Store local panel metadata
+      ansible.builtin.set_fact:
+        x_ui_vless_tls_metadata: "{{ x_ui_vless_tls_metadata_raw.stdout | from_json }}"
+      no_log: true
+
+    - name: VLESS TLS API | Guard | Require safe runtime metadata
+      ansible.builtin.assert:
+        that:
+          - >-
+            (x_ui_vless_tls_metadata.backend_declared in ['sqlite', 'sqlite3'] and x_ui_vless_tls_metadata.backend_detected == 'sqlite') or
+            (x_ui_vless_tls_metadata.backend_declared in ['postgres', 'postgresql'] and x_ui_vless_tls_metadata.backend_detected == 'postgres')
+          - x_ui_vless_tls_metadata.service_active | bool
+          - x_ui_vless_tls_metadata.api_token_present | bool
+          - x_ui_vless_tls_metadata.panel_port | int > 0
+        fail_msg: >-
+          Refusing VLESS TLS creation because backend, service, bearer token, or panel port detection is unsafe.
+
+    - name: VLESS TLS API | Read-only | Check target port availability through API
+      ansible.builtin.shell: |
+        python3 - <<'PY'
+        import json
+        import ssl
+        import urllib.request
+
+        metadata = json.loads(r'''{{ x_ui_vless_tls_metadata | to_json }}''')
+        token = metadata['api_token']
+        target_port = {{ x_ui_inbound_port | int }}
+        root = f'https://127.0.0.1:{metadata["panel_port"]}{metadata["base_path"]}'
+        opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ssl._create_unverified_context()))
+        req = urllib.request.Request(root + 'panel/api/inbounds/list', headers={'Authorization': 'Bearer ' + token}, method='GET')
+        resp = opener.open(req, timeout=15)
+        parsed = json.loads(resp.read().decode('utf-8', 'replace') or '{}')
+        inbounds = parsed.get('obj') if isinstance(parsed, dict) else []
+        if not isinstance(inbounds, list):
+            inbounds = []
+        conflict = any(isinstance(item, dict) and int(item.get('port') or 0) == target_port and str(item.get('protocol') or '').lower() == 'vless' for item in inbounds)
+        print(json.dumps({'inbound_count_before': len(inbounds), 'target_vless_port_conflict': conflict}, sort_keys=True))
+        PY
+      args:
+        executable: /bin/bash
+      register: x_ui_vless_tls_preflight_raw
+      changed_when: false
+      no_log: true
+
+    - name: VLESS TLS API | Sanitized output | Store preflight summary
+      ansible.builtin.set_fact:
+        x_ui_vless_tls_preflight: "{{ x_ui_vless_tls_preflight_raw.stdout | from_json }}"
+
+    - name: VLESS TLS API | Guard | Refuse duplicate VLESS port
+      ansible.builtin.assert:
+        that:
+          - not (x_ui_vless_tls_preflight.target_vless_port_conflict | bool)
+        fail_msg: "A VLESS inbound already exists on the target port. Clear or migrate it before creating a new one."
+
+    - name: VLESS TLS API | Mutating | Back up SQLite database before inbound creation
+      ansible.builtin.copy:
+        src: "{{ x_ui_sqlite_database_path }}"
+        dest: "{{ x_ui_backup_dir }}/x-ui-backup-before-vless-tls-inbound-{{ ansible_date_time.iso8601_basic_short }}.db"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0600"
+      when: x_ui_vless_tls_metadata.backend_detected == 'sqlite'
+
+    - name: VLESS TLS API | Mutating | Back up PostgreSQL database before inbound creation
+      ansible.builtin.shell: |
+        python3 - <<'PY'
+        import os
+        import subprocess
+        import urllib.parse
+
+        env_values = {}
+        for path in ['{{ x_ui_default_env_path }}', '{{ x_ui_install_env_path }}']:
+            if os.path.exists(path):
+                with open(path, encoding='utf-8', errors='replace') as handle:
+                    for raw_line in handle:
+                        line = raw_line.strip()
+                        if line and not line.startswith('#') and '=' in line:
+                            key, value = line.split('=', 1)
+                            env_values[key.strip()] = value.strip().strip('"').strip("'")
+        dsn = env_values.get('XUI_DB_DSN') or ''
+        if not dsn:
+            raise SystemExit('XUI_DB_DSN missing')
+        parsed = urllib.parse.urlparse(dsn)
+        pg_env = os.environ.copy()
+        pg_env.update({
+            'PGHOST': parsed.hostname or '',
+            'PGPORT': str(parsed.port or 5432),
+            'PGUSER': urllib.parse.unquote(parsed.username or ''),
+            'PGPASSWORD': urllib.parse.unquote(parsed.password or ''),
+            'PGDATABASE': (parsed.path or '/').lstrip('/'),
+            'PGCONNECT_TIMEOUT': '10',
+        })
+        backup_path = '{{ x_ui_backup_dir }}/x-ui-postgres-backup-before-vless-tls-inbound-{{ ansible_date_time.iso8601_basic_short }}.sql'
+        with open(backup_path, 'w', encoding='utf-8') as handle:
+            result = subprocess.run(['pg_dump', '--no-owner', '--no-privileges'], text=True, stdout=handle, stderr=subprocess.PIPE, env=pg_env, check=False, timeout=60)
+        os.chmod(backup_path, 0o600)
+        if result.returncode != 0:
+            raise SystemExit('pg_dump failed')
+        print(backup_path)
+        PY
+      args:
+        executable: /bin/bash
+      register: x_ui_vless_tls_postgres_backup
+      changed_when: true
+      no_log: true
+      when: x_ui_vless_tls_metadata.backend_detected == 'postgres'
+
+    - name: VLESS TLS API | Mutating | Create VLESS TLS inbound through bearer API
+      ansible.builtin.shell: |
+        python3 - <<'PY'
+        import json
+        import os
+        import ssl
+        import urllib.error
+        import urllib.request
+
+        status_path = '{{ x_ui_vless_tls_status_path }}'
+        metadata = json.loads(r'''{{ x_ui_vless_tls_metadata | to_json }}''')
+        token = metadata['api_token']
+        root = f'https://127.0.0.1:{metadata["panel_port"]}{metadata["base_path"]}'
+        payload = {
+            'enable': True,
+            'remark': '{{ x_ui_inbound_remark }}',
+            'listen': '',
+            'port': {{ x_ui_inbound_port | int }},
+            'protocol': 'vless',
+            'expiryTime': 0,
+            'total': 0,
+            'settings': {'clients': [], 'decryption': 'none', 'encryption': 'none', 'fallbacks': [{'dest': {{ x_ui_fallback_dest | int }}}]},
+            'streamSettings': {
+                'network': 'tcp',
+                'security': 'tls',
+                'tlsSettings': {
+                    'serverName': '{{ x_ui_domain }}',
+                    'minVersion': '1.2',
+                    'maxVersion': '1.3',
+                    'cipherSuites': '',
+                    'rejectUnknownSni': False,
+                    'certificates': [{'certificateFile': '{{ x_ui_cert_fullchain_path }}', 'keyFile': '{{ x_ui_cert_key_path }}', 'usage': 'encipherment'}],
+                    'alpn': ['http/1.1'],
+                },
+            },
+            'sniffing': {'enabled': True, 'destOverride': ['http', 'tls', 'quic'], 'metadataOnly': False, 'routeOnly': False},
+        }
+
+        def api_success(text):
+            try:
+                parsed = json.loads(text or '{}')
+            except json.JSONDecodeError:
+                return True
+            return bool(parsed.get('success', True))
+
+        context = ssl._create_unverified_context()
+        opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=context))
+        errors = []
+        for scheme in ['https', 'http']:
+            candidate_root = root.replace('https://', f'{scheme}://', 1)
+            try:
+                req = urllib.request.Request(
+                    candidate_root + 'panel/api/inbounds/add',
+                    data=json.dumps(payload).encode(),
+                    headers={'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token},
+                    method='POST',
+                )
+                resp = opener.open(req, timeout=30)
+                text = resp.read().decode('utf-8', 'replace')
+                if resp.status >= 400 or not api_success(text):
+                    raise RuntimeError('add_failed')
+                with open(status_path, 'w', encoding='utf-8') as handle:
+                    json.dump({'created': True, 'port': payload['port']}, handle, sort_keys=True)
+                raise SystemExit(0)
+            except urllib.error.HTTPError as exc:
+                errors.append(f'http_status_{exc.code}')
+            except urllib.error.URLError as exc:
+                errors.append(f'url_error_{exc.reason.__class__.__name__}')
+            except Exception as exc:
+                errors.append(exc.__class__.__name__)
+        with open(status_path, 'w', encoding='utf-8') as handle:
+            json.dump({'created': False, 'error': errors[-1] if errors else 'unknown'}, handle, sort_keys=True)
+        raise SystemExit(1)
+        PY
+      args:
+        executable: /bin/bash
+      register: x_ui_vless_tls_create_raw
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: VLESS TLS API | Read-only | Read sanitized creation status
+      ansible.builtin.command: "python3 -m json.tool {{ x_ui_vless_tls_status_path }}"
+      register: x_ui_vless_tls_create_status
+      changed_when: false
+
+    - name: VLESS TLS API | Guard | Require successful API create
+      ansible.builtin.assert:
+        that:
+          - x_ui_vless_tls_create_raw.rc == 0
+          - (x_ui_vless_tls_create_status.stdout | from_json).created | bool
+        fail_msg: "3x-ui VLESS TLS API create failed: {{ (x_ui_vless_tls_create_status.stdout | from_json).error | default('unknown') }}"
+
+    - name: VLESS TLS API | Read-only | Verify created inbound shape through API
+      ansible.builtin.shell: |
+        python3 - <<'PY'
+        import json
+        import ssl
+        import urllib.request
+
+        metadata = json.loads(r'''{{ x_ui_vless_tls_metadata | to_json }}''')
+        token = metadata['api_token']
+        target_port = {{ x_ui_inbound_port | int }}
+        root = f'https://127.0.0.1:{metadata["panel_port"]}{metadata["base_path"]}'
+        opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ssl._create_unverified_context()))
+        req = urllib.request.Request(root + 'panel/api/inbounds/list', headers={'Authorization': 'Bearer ' + token}, method='GET')
+        resp = opener.open(req, timeout=15)
+        parsed = json.loads(resp.read().decode('utf-8', 'replace') or '{}')
+        inbounds = parsed.get('obj') if isinstance(parsed, dict) else []
+        matches = []
+        for item in inbounds if isinstance(inbounds, list) else []:
+            if not isinstance(item, dict) or int(item.get('port') or 0) != target_port or str(item.get('protocol') or '').lower() != 'vless':
+                continue
+            settings = item.get('settings') or {}
+            stream = item.get('streamSettings') or item.get('stream_settings') or {}
+            sniffing = item.get('sniffing') or {}
+            if isinstance(settings, str):
+                settings = json.loads(settings or '{}')
+            if isinstance(stream, str):
+                stream = json.loads(stream or '{}')
+            if isinstance(sniffing, str):
+                sniffing = json.loads(sniffing or '{}')
+            clients = settings.get('clients') or []
+            matches.append({
+                'enable': bool(item.get('enable')),
+                'fallback_dests': [fb.get('dest') for fb in settings.get('fallbacks', []) if isinstance(fb, dict)],
+                'network': stream.get('network'),
+                'port': item.get('port'),
+                'protocol': item.get('protocol'),
+                'security': stream.get('security'),
+                'sniffing_enabled': bool(sniffing.get('enabled')),
+                'client_count': len(clients) if isinstance(clients, list) else None,
+            })
+        print(json.dumps({'match_count': len(matches), 'matches': matches}, sort_keys=True))
+        PY
+      args:
+        executable: /bin/bash
+      register: x_ui_vless_tls_verify_raw
+      changed_when: false
+      no_log: true
+
+    - name: VLESS TLS API | Sanitized output | Store verification summary
+      ansible.builtin.set_fact:
+        x_ui_vless_tls_verify: "{{ x_ui_vless_tls_verify_raw.stdout | from_json }}"
+
+    - name: VLESS TLS API | Guard | Require expected final shape
+      ansible.builtin.assert:
+        that:
+          - x_ui_vless_tls_verify.match_count | int == 1
+          - x_ui_vless_tls_verify.matches[0].enable | bool
+          - x_ui_vless_tls_verify.matches[0].network == 'tcp'
+          - x_ui_vless_tls_verify.matches[0].security == 'tls'
+          - x_ui_fallback_dest | int in x_ui_vless_tls_verify.matches[0].fallback_dests
+          - x_ui_vless_tls_verify.matches[0].client_count | int == 0
+        fail_msg: "VLESS TLS inbound final shape did not match expected TCP/TLS/fallback/empty-client state."
+
+    - name: VLESS TLS API | Read-only | Verify x-ui service after mutation
+      ansible.builtin.command: systemctl --no-pager is-active x-ui.service
+      register: x_ui_vless_tls_service_active
+      changed_when: false
+
+    - name: VLESS TLS API | Sanitized output | Show final result
+      ansible.builtin.debug:
+        msg:
+          host: "{{ inventory_hostname }}"
+          port: "{{ x_ui_inbound_port | int }}"
+          protocol: "{{ x_ui_vless_tls_verify.matches[0].protocol }}"
+          network: "{{ x_ui_vless_tls_verify.matches[0].network }}"
+          security: "{{ x_ui_vless_tls_verify.matches[0].security }}"
+          client_count: "{{ x_ui_vless_tls_verify.matches[0].client_count }}"
+          fallback_dests: "{{ x_ui_vless_tls_verify.matches[0].fallback_dests }}"
+          x_ui_service_active: "{{ x_ui_vless_tls_service_active.stdout }}"

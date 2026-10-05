@@ -1,0 +1,82 @@
+---
+- name: Install nginx for local Xray fallback
+  ansible.builtin.apt:
+    name: nginx
+    state: present
+    update_cache: true
+
+- name: Ensure fallback web root exists
+  ansible.builtin.file:
+    path: "{{ proxy_fallback_root }}"
+    state: directory
+    owner: www-data
+    group: www-data
+    mode: "0755"
+
+- name: Install fallback CDN placeholder page
+  ansible.builtin.template:
+    src: index.html.j2
+    dest: "{{ proxy_fallback_root }}/index.html"
+    owner: www-data
+    group: www-data
+    mode: "0644"
+  notify: Restart nginx
+
+- name: Disable default public nginx site
+  ansible.builtin.file:
+    path: /etc/nginx/sites-enabled/default
+    state: absent
+  notify: Restart nginx
+
+- name: Install loopback-only fallback nginx site
+  ansible.builtin.template:
+    src: xray-fallback.conf.j2
+    dest: /etc/nginx/conf.d/xray-fallback.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart nginx
+
+- name: Validate nginx configuration
+  ansible.builtin.command: nginx -t
+  changed_when: false
+
+- name: Ensure nginx is enabled and running
+  ansible.builtin.systemd_service:
+    name: nginx.service
+    enabled: true
+    state: started
+  when: not ansible_check_mode
+
+- name: Apply nginx configuration before endpoint verification
+  ansible.builtin.meta: flush_handlers
+
+- name: Check fallback listener before endpoint verification
+  ansible.builtin.shell: "ss -H -ltn '( sport = :{{ proxy_fallback_listen_port }} )' | grep -E '{{ proxy_fallback_listen_address }}:{{ proxy_fallback_listen_port }}' >/dev/null"
+  register: proxy_fallback_listener_check
+  changed_when: false
+  failed_when: false
+  when: not ansible_check_mode
+
+- name: Restart nginx if fallback listener is not active
+  ansible.builtin.systemd_service:
+    name: nginx.service
+    state: restarted
+  when:
+    - not ansible_check_mode
+    - proxy_fallback_listener_check.rc | default(1) != 0
+
+- name: Verify fallback endpoint on loopback
+  ansible.builtin.uri:
+    url: "http://{{ proxy_fallback_listen_address }}:{{ proxy_fallback_listen_port }}/"
+    return_content: false
+    status_code: 200
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: Verify fallback listener is loopback-only
+  ansible.builtin.shell: >-
+    ! ss -H -ltn '( sport = :{{ proxy_fallback_listen_port }} )'
+    | grep -E '0\.0\.0\.0:{{ proxy_fallback_listen_port }}|\[::\]:{{ proxy_fallback_listen_port }}' >/dev/null
+  changed_when: false
+  when: not ansible_check_mode

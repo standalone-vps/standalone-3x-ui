@@ -1,0 +1,38 @@
+---
+- name: Configure loopback-only nginx fallback for Xray TLS inbounds
+  hosts: all
+  gather_facts: true
+  become: true
+  vars:
+    allow_proxy_fallback_nginx: false
+  pre_tasks:
+    - name: Require an explicit single-host limit for nginx fallback rollout
+      ansible.builtin.assert:
+        that:
+          - ansible_limit is defined
+          - ansible_limit | length > 0
+          - ansible_play_hosts_all | length == 1
+        fail_msg: "Nginx fallback setup is mutating. Run with an explicit single-host --limit standalone."
+
+    - name: Require explicit approval for nginx fallback mutation
+      ansible.builtin.assert:
+        that:
+          - allow_proxy_fallback_nginx | bool
+        fail_msg: "Set -e allow_proxy_fallback_nginx=true after reviewing this host's service state."
+
+    - name: Require Ubuntu target
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution == 'Ubuntu'
+          - ansible_distribution_major_version | int == 24
+        fail_msg: "This nginx fallback path is currently validated only for Ubuntu 24.04 targets."
+
+    - name: Show rollout and rollback notes
+      ansible.builtin.debug:
+        msg:
+          - "This playbook installs nginx but binds the fallback site only to 127.0.0.1:8000."
+          - "Rollback: disable /etc/nginx/conf.d/xray-fallback.conf, run nginx -t, then restart nginx."
+          - "Do not run on multiple hosts at once; verify local fallback before configuring the 3x-ui inbound fallback dest."
+
+  roles:
+    - role: proxy_fallback_nginx

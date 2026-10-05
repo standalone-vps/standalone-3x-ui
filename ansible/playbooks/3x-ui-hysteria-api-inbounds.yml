@@ -1,0 +1,585 @@
+---
+- name: Create empty Hysteria2 inbounds through 3x-ui bearer API
+  hosts: all
+  gather_facts: true
+  become: true
+  vars:
+    allow_x_ui_hysteria_api_inbounds_apply: false
+    x_ui_hysteria_api_allowed_nodes:
+      - standalone
+    x_ui_domain: "{{ public_hostname | default('') }}"
+    x_ui_hysteria_inbounds:
+      - remark: "{{ inventory_hostname }}_hy2_{{ hysteria_port | default(443) }}"
+        port: "{{ hysteria_port | default(443) }}"
+        udp_idle_timeout: 60
+    x_ui_default_env_path: /etc/default/x-ui
+    x_ui_install_env_path: /etc/x-ui/install-result.env
+    x_ui_sqlite_database_path: /etc/x-ui/x-ui.db
+    x_ui_binary_path: /usr/local/x-ui/x-ui
+    x_ui_backup_dir: /root
+    x_ui_hysteria_status_path: /root/x-ui-hysteria-api-inbounds-status.json
+
+  pre_tasks:
+    - name: Hysteria API | Guard | Require explicit single-host limit and approval
+      ansible.builtin.assert:
+        that:
+          - ansible_limit is defined
+          - ansible_limit | length > 0
+          - ansible_play_hosts_all | length == 1
+          - allow_x_ui_hysteria_api_inbounds_apply | bool
+        fail_msg: >-
+          Hysteria2 inbound creation is mutating. Run with an explicit single-host
+          --limit and -e allow_x_ui_hysteria_api_inbounds_apply=true after preflight review.
+
+    - name: Hysteria API | Guard | Require approved trial node
+      ansible.builtin.assert:
+        that:
+          - inventory_hostname in x_ui_hysteria_api_allowed_nodes
+        fail_msg: >-
+          Hysteria2 API inbound creation is currently approved only for
+          {{ x_ui_hysteria_api_allowed_nodes | join(', ') }}.
+
+    - name: Hysteria API | Guard | Require declared x-ui database backend
+      ansible.builtin.assert:
+        that:
+          - x_ui_db_backend is defined
+          - x_ui_db_backend in ['sqlite', 'sqlite3', 'postgres', 'postgresql']
+        fail_msg: "Set per-host x_ui_db_backend to sqlite or postgres before Hysteria2 inbound creation."
+
+    - name: Hysteria API | Guard | Validate requested inbound definitions
+      ansible.builtin.assert:
+        that:
+          - item.remark is defined
+          - item.remark | string | length > 0
+          - item.port is defined
+          - item.port | int > 0
+          - item.port | int <= 65535
+          - item.udp_idle_timeout | default(60) | int >= 2
+          - item.udp_idle_timeout | default(60) | int <= 600
+        fail_msg: "Each Hysteria2 inbound requires remark, port 1..65535, and optional udp_idle_timeout 2..600."
+      loop: "{{ x_ui_hysteria_inbounds }}"
+      loop_control:
+        label: "{{ item.remark | default('missing-remark') }}:{{ item.port | default('missing-port') }}"
+
+    - name: Hysteria API | Sanitized output | Build requested port list
+      ansible.builtin.set_fact:
+        x_ui_hysteria_ports: "{{ x_ui_hysteria_inbounds | map(attribute='port') | map('int') | list }}"
+
+    - name: Hysteria API | Guard | Require unique requested ports
+      ansible.builtin.assert:
+        that:
+          - x_ui_hysteria_ports | unique | length == x_ui_hysteria_ports | length
+        fail_msg: "Requested Hysteria2 inbound ports must be unique."
+
+    - name: Hysteria API | Guard | Show rollout and rollback notes
+      ansible.builtin.debug:
+        msg:
+          - "This playbook creates empty Hysteria2 inbounds through local 3x-ui bearer API."
+          - "Requested UDP ports: {{ x_ui_hysteria_ports | join(', ') }}. Confirm host and provider firewalls intentionally expose them."
+          - "It backs up SQLite with a DB copy or PostgreSQL with pg_dump before creation."
+          - "Rollback: remove the created Hysteria2 inbounds through the panel/API or restore the printed backup after review."
+          - "Tokens, DB DSNs, panel URLs, cert private keys and raw API payloads are hidden with no_log."
+
+  tasks:
+    - name: Hysteria API | Read-only | Collect local panel metadata with secret reads hidden
+      ansible.builtin.shell: |
+        python3 - <<'PY'
+        import json
+        import os
+        import re
+        import subprocess
+
+        default_env_path = '{{ x_ui_default_env_path }}'
+        install_env_path = '{{ x_ui_install_env_path }}'
+        binary_path = '{{ x_ui_binary_path }}'
+        explicit_domain = '{{ x_ui_domain }}'
+
+        def read_env(path):
+            values = {}
+            if not os.path.exists(path):
+                return values
+            with open(path, encoding='utf-8', errors='replace') as handle:
+                for raw_line in handle:
+                    line = raw_line.strip()
+                    if not line or line.startswith('#') or '=' not in line:
+                        continue
+                    key, value = line.split('=', 1)
+                    values[key.strip()] = value.strip().strip('"').strip("'")
+            return values
+
+        default_env = read_env(default_env_path)
+        install_env = read_env(install_env_path)
+        env = {**default_env, **install_env}
+        backend = (default_env.get('XUI_DB_TYPE') or install_env.get('XUI_DB_TYPE') or 'sqlite').strip().lower() or 'sqlite'
+        if backend == 'sqlite3':
+            backend = 'sqlite'
+        if backend == 'postgresql':
+            backend = 'postgres'
+
+        panel_port = env.get('XUI_PANEL_PORT') or ''
+        base_path = env.get('XUI_WEB_BASE_PATH') or '/'
+        if not panel_port:
+            result = subprocess.run([binary_path, 'setting', '-show', 'true'], text=True, capture_output=True, check=False, timeout=10)
+            combined = result.stdout + '\n' + result.stderr
+            port_match = re.search(r'(?im)^\s*port:\s*(\S+)', combined)
+            base_match = re.search(r'(?im)^\s*webBasePath:\s*(\S+)', combined)
+            if port_match:
+                panel_port = port_match.group(1)
+            if base_match and base_path == '/':
+                base_path = base_match.group(1)
+        if not base_path.startswith('/'):
+            base_path = '/' + base_path
+        if not base_path.endswith('/'):
+            base_path += '/'
+
+        cert_candidates = []
+        if explicit_domain:
+            candidate_dir = os.path.join('/root/cert', explicit_domain)
+            cert_candidates.append((explicit_domain, candidate_dir))
+        elif os.path.isdir('/root/cert'):
+            for name in sorted(os.listdir('/root/cert')):
+                candidate_dir = os.path.join('/root/cert', name)
+                if os.path.isdir(candidate_dir):
+                    cert_candidates.append((name, candidate_dir))
+
+        valid_certs = []
+        for server_name, cert_dir in cert_candidates:
+            fullchain = os.path.join(cert_dir, 'fullchain.pem')
+            key = os.path.join(cert_dir, 'privkey.pem')
+            if os.path.exists(fullchain) and os.path.exists(key):
+                valid_certs.append({'server_name': server_name, 'fullchain': fullchain, 'key': key})
+
+        selected_cert = valid_certs[0] if len(valid_certs) == 1 else {}
+        service_result = subprocess.run(['systemctl', '--no-pager', 'is-active', 'x-ui.service'], text=True, capture_output=True, check=False, timeout=10)
+        print(json.dumps({
+            'api_token_present': bool(env.get('XUI_API_TOKEN')),
+            'backend_declared': '{{ x_ui_db_backend }}',
+            'backend_detected': backend,
+            'base_path_detected': bool(base_path),
+            'cert_candidate_count': len(valid_certs),
+            'cert_selected': bool(selected_cert),
+            'fullchain': selected_cert.get('fullchain', ''),
+            'key': selected_cert.get('key', ''),
+            'panel_port': panel_port if str(panel_port).isdigit() else '',
+            'panel_port_detected': bool(panel_port),
+            'server_name': selected_cert.get('server_name', ''),
+            'service_active': service_result.stdout.strip() == 'active',
+        }, sort_keys=True))
+        PY
+      register: x_ui_hysteria_metadata_raw
+      changed_when: false
+      no_log: true
+
+    - name: Hysteria API | Sanitized output | Store local panel metadata
+      ansible.builtin.set_fact:
+        x_ui_hysteria_metadata: "{{ x_ui_hysteria_metadata_raw.stdout | from_json }}"
+
+    - name: Hysteria API | Guard | Require safe runtime metadata
+      ansible.builtin.assert:
+        that:
+          - >-
+            (x_ui_hysteria_metadata.backend_declared in ['sqlite', 'sqlite3'] and x_ui_hysteria_metadata.backend_detected == 'sqlite') or
+            (x_ui_hysteria_metadata.backend_declared in ['postgres', 'postgresql'] and x_ui_hysteria_metadata.backend_detected == 'postgres')
+          - x_ui_hysteria_metadata.service_active | bool
+          - x_ui_hysteria_metadata.api_token_present | bool
+          - x_ui_hysteria_metadata.panel_port_detected | bool
+          - x_ui_hysteria_metadata.cert_selected | bool
+        fail_msg: >-
+          Refusing Hysteria2 creation because backend, service, bearer token, panel port, or TLS cert detection is unsafe.
+          backend_detected={{ x_ui_hysteria_metadata.backend_detected }}, service_active={{ x_ui_hysteria_metadata.service_active }},
+          api_token_present={{ x_ui_hysteria_metadata.api_token_present }}, panel_port_detected={{ x_ui_hysteria_metadata.panel_port_detected }},
+          cert_candidate_count={{ x_ui_hysteria_metadata.cert_candidate_count }}.
+
+    - name: Hysteria API | Sanitized output | Show pre-change metadata
+      ansible.builtin.debug:
+        msg:
+          host: "{{ inventory_hostname }}"
+          backend_declared: "{{ x_ui_hysteria_metadata.backend_declared }}"
+          backend_detected: "{{ x_ui_hysteria_metadata.backend_detected }}"
+          service_active: "{{ x_ui_hysteria_metadata.service_active }}"
+          panel_port_detected: "{{ x_ui_hysteria_metadata.panel_port_detected }}"
+          cert_selected: "{{ x_ui_hysteria_metadata.cert_selected }}"
+          cert_candidate_count: "{{ x_ui_hysteria_metadata.cert_candidate_count }}"
+          requested_ports: "{{ x_ui_hysteria_ports }}"
+
+    - name: Hysteria API | Read-only | Check existing inbound port conflicts through API
+      ansible.builtin.shell: |
+        python3 - <<'PY'
+        import json
+        import os
+        import ssl
+        import urllib.request
+
+        ports = set({{ x_ui_hysteria_ports | to_json }})
+        env = {}
+        for path in ['{{ x_ui_default_env_path }}', '{{ x_ui_install_env_path }}']:
+            if os.path.exists(path):
+                with open(path, encoding='utf-8', errors='replace') as handle:
+                    for raw_line in handle:
+                        line = raw_line.strip()
+                        if line and not line.startswith('#') and '=' in line:
+                            key, value = line.split('=', 1)
+                            env[key.strip()] = value.strip().strip('"').strip("'")
+        token = env.get('XUI_API_TOKEN') or ''
+        base_path = env.get('XUI_WEB_BASE_PATH') or '/'
+        if not base_path.startswith('/'):
+            base_path = '/' + base_path
+        if not base_path.endswith('/'):
+            base_path += '/'
+        roots = [f'https://127.0.0.1:{{ x_ui_hysteria_metadata.panel_port }}{base_path}', f'http://127.0.0.1:{{ x_ui_hysteria_metadata.panel_port }}{base_path}']
+        context = ssl._create_unverified_context()
+        opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=context))
+
+        def extract_list(text):
+            parsed = json.loads(text or '{}')
+            if isinstance(parsed, list):
+                return parsed
+            if isinstance(parsed, dict):
+                obj = parsed.get('obj') or parsed.get('data') or parsed.get('result') or parsed.get('results') or []
+                if isinstance(obj, list):
+                    return obj
+                if isinstance(obj, dict):
+                    for key in ('inbounds', 'list'):
+                        if isinstance(obj.get(key), list):
+                            return obj[key]
+            return []
+
+        errors = []
+        for root in roots:
+            try:
+                req = urllib.request.Request(root + 'panel/api/inbounds/list', headers={'Authorization': 'Bearer ' + token}, method='GET')
+                resp = opener.open(req, timeout=15)
+                items = extract_list(resp.read().decode('utf-8', 'replace'))
+                def allows_hysteria_shared_port(item):
+                    if str(item.get('protocol') or '').lower() != 'vless':
+                        return False
+                    stream = item.get('streamSettings') or item.get('stream_settings') or {}
+                    if isinstance(stream, str):
+                        try:
+                            stream = json.loads(stream or '{}')
+                        except json.JSONDecodeError:
+                            return False
+                    return isinstance(stream, dict) and str(stream.get('network') or '').lower() == 'tcp'
+
+                conflicts = sorted(
+                    int(item.get('port'))
+                    for item in items
+                    if isinstance(item, dict)
+                    and str(item.get('port') or '').isdigit()
+                    and int(item.get('port')) in ports
+                    and not allows_hysteria_shared_port(item)
+                )
+                print(json.dumps({'conflicting_ports': conflicts, 'existing_inbound_count': len(items)}, sort_keys=True))
+                raise SystemExit(0)
+            except Exception as exc:
+                errors.append(exc.__class__.__name__)
+        print(json.dumps({'conflicting_ports': [], 'existing_inbound_count': None, 'error': errors[-1] if errors else 'unknown'}, sort_keys=True))
+        raise SystemExit(1)
+        PY
+      register: x_ui_hysteria_conflicts_raw
+      changed_when: false
+      no_log: true
+
+    - name: Hysteria API | Sanitized output | Store inbound conflict summary
+      ansible.builtin.set_fact:
+        x_ui_hysteria_conflicts: "{{ x_ui_hysteria_conflicts_raw.stdout | from_json }}"
+
+    - name: Hysteria API | Guard | Refuse existing inbound port conflicts
+      ansible.builtin.assert:
+        that:
+          - x_ui_hysteria_conflicts.conflicting_ports | length == 0
+        fail_msg: "Inbound ports already exist: {{ x_ui_hysteria_conflicts.conflicting_ports | join(', ') }}. Do not overwrite them without a migration plan."
+
+    - name: Hysteria API | Mutating | Back up SQLite database before creation
+      ansible.builtin.copy:
+        src: "{{ x_ui_sqlite_database_path }}"
+        dest: "{{ x_ui_backup_dir }}/x-ui-backup-before-hysteria-api-inbounds-{{ ansible_date_time.iso8601_basic_short }}.db"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0600"
+      register: x_ui_hysteria_sqlite_backup
+      when: x_ui_hysteria_metadata.backend_detected == 'sqlite'
+
+    - name: Hysteria API | Mutating | Back up PostgreSQL database before creation
+      ansible.builtin.shell: |
+        python3 - <<'PY'
+        import os
+        import subprocess
+        import urllib.parse
+
+        env_values = {}
+        for path in ['{{ x_ui_default_env_path }}', '{{ x_ui_install_env_path }}']:
+            if os.path.exists(path):
+                with open(path, encoding='utf-8', errors='replace') as handle:
+                    for raw_line in handle:
+                        line = raw_line.strip()
+                        if line and not line.startswith('#') and '=' in line:
+                            key, value = line.split('=', 1)
+                            env_values[key.strip()] = value.strip().strip('"').strip("'")
+        dsn = env_values.get('XUI_DB_DSN') or ''
+        if not dsn:
+            raise SystemExit('XUI_DB_DSN missing')
+        parsed = urllib.parse.urlparse(dsn)
+        pg_env = os.environ.copy()
+        pg_env.update({
+            'PGHOST': parsed.hostname or '',
+            'PGPORT': str(parsed.port or 5432),
+            'PGUSER': urllib.parse.unquote(parsed.username or ''),
+            'PGPASSWORD': urllib.parse.unquote(parsed.password or ''),
+            'PGDATABASE': (parsed.path or '/').lstrip('/'),
+            'PGCONNECT_TIMEOUT': '10',
+        })
+        backup_path = '{{ x_ui_backup_dir }}/x-ui-postgres-backup-before-hysteria-api-inbounds-{{ ansible_date_time.iso8601_basic_short }}.sql'
+        with open(backup_path, 'w', encoding='utf-8') as handle:
+            result = subprocess.run(['pg_dump', '--no-owner', '--no-privileges'], text=True, stdout=handle, stderr=subprocess.PIPE, env=pg_env, check=False, timeout=60)
+        os.chmod(backup_path, 0o600)
+        if result.returncode != 0:
+            raise SystemExit('pg_dump failed')
+        print(backup_path)
+        PY
+      register: x_ui_hysteria_postgres_backup
+      changed_when: true
+      no_log: true
+      when: x_ui_hysteria_metadata.backend_detected == 'postgres'
+
+    - name: Hysteria API | Sanitized output | Show backup status
+      ansible.builtin.debug:
+        msg:
+          host: "{{ inventory_hostname }}"
+          backend: "{{ x_ui_hysteria_metadata.backend_detected }}"
+          backup_created: true
+          backup_type: "{{ 'postgres_pg_dump' if x_ui_hysteria_metadata.backend_detected == 'postgres' else 'sqlite_copy' }}"
+
+    - name: Hysteria API | Mutating | Create Hysteria2 inbounds through bearer API
+      ansible.builtin.shell: |
+        python3 - <<'PY'
+        import json
+        import os
+        import ssl
+        import sys
+        import urllib.error
+        import urllib.request
+
+        status_path = '{{ x_ui_hysteria_status_path }}'
+        inbounds = {{ x_ui_hysteria_inbounds | to_json }}
+        cert_file = '{{ x_ui_hysteria_metadata.fullchain }}'
+        key_file = '{{ x_ui_hysteria_metadata.key }}'
+        server_name = '{{ x_ui_hysteria_metadata.server_name }}'
+
+        env = {}
+        for path in ['{{ x_ui_default_env_path }}', '{{ x_ui_install_env_path }}']:
+            if os.path.exists(path):
+                with open(path, encoding='utf-8', errors='replace') as handle:
+                    for raw_line in handle:
+                        line = raw_line.strip()
+                        if line and not line.startswith('#') and '=' in line:
+                            key, value = line.split('=', 1)
+                            env[key.strip()] = value.strip().strip('"').strip("'")
+        token = env.get('XUI_API_TOKEN') or ''
+        base_path = env.get('XUI_WEB_BASE_PATH') or '/'
+        if not base_path.startswith('/'):
+            base_path = '/' + base_path
+        if not base_path.endswith('/'):
+            base_path += '/'
+
+        payloads = []
+        for inbound in inbounds:
+            port = int(inbound['port'])
+            idle_timeout = int(inbound.get('udp_idle_timeout', 60))
+            payloads.append({
+                'enable': bool(inbound.get('enable', True)),
+                'remark': str(inbound['remark']),
+                'listen': str(inbound.get('listen', '')),
+                'port': port,
+                'protocol': 'hysteria',
+                'expiryTime': int(inbound.get('expiry_time', 0)),
+                'total': int(inbound.get('total', 0)),
+                'settings': {'version': 2, 'clients': []},
+                'streamSettings': {
+                    'network': 'hysteria',
+                    'security': 'tls',
+                    'hysteriaSettings': {'version': 2, 'auth': str(inbound.get('auth', '')), 'udpIdleTimeout': idle_timeout},
+                    'tlsSettings': {
+                        'serverName': str(inbound.get('server_name') or server_name),
+                        'minVersion': '1.2',
+                        'maxVersion': '1.3',
+                        'cipherSuites': '',
+                        'rejectUnknownSni': False,
+                        'certificates': [{'certificateFile': cert_file, 'keyFile': key_file, 'usage': 'encipherment'}],
+                        'alpn': inbound.get('alpn') or ['h3'],
+                    },
+                },
+                'sniffing': {
+                    'enabled': bool(inbound.get('sniffing_enabled', True)),
+                    'destOverride': inbound.get('dest_override') or ['http', 'tls', 'quic'],
+                    'metadataOnly': False,
+                    'routeOnly': False,
+                },
+            })
+
+        def api_success(text):
+            try:
+                parsed = json.loads(text or '{}')
+            except json.JSONDecodeError:
+                return True
+            return bool(parsed.get('success', True))
+
+        context = ssl._create_unverified_context()
+        opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=context))
+        roots = [f'https://127.0.0.1:{{ x_ui_hysteria_metadata.panel_port }}{base_path}', f'http://127.0.0.1:{{ x_ui_hysteria_metadata.panel_port }}{base_path}']
+        errors = []
+        for root in roots:
+            created = []
+            try:
+                for payload in payloads:
+                    req = urllib.request.Request(
+                        root + 'panel/api/inbounds/add',
+                        data=json.dumps(payload).encode(),
+                        headers={'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token},
+                        method='POST',
+                    )
+                    resp = opener.open(req, timeout=30)
+                    text = resp.read().decode('utf-8', 'replace')
+                    if resp.status >= 400 or not api_success(text):
+                        raise RuntimeError('add failed')
+                    created.append({'port': payload['port']})
+                with open(status_path, 'w', encoding='utf-8') as handle:
+                    json.dump({'created': True, 'created_ports': [item['port'] for item in created]}, handle, sort_keys=True)
+                sys.exit(0)
+            except urllib.error.HTTPError as exc:
+                errors.append(f'http_status_{exc.code}')
+            except urllib.error.URLError as exc:
+                errors.append(f'url_error_{exc.reason.__class__.__name__}')
+            except Exception as exc:
+                errors.append(exc.__class__.__name__)
+        with open(status_path, 'w', encoding='utf-8') as handle:
+            json.dump({'created': False, 'error': errors[-1] if errors else 'unknown'}, handle, sort_keys=True)
+        raise SystemExit(1)
+        PY
+      register: x_ui_hysteria_create_raw
+      changed_when: true
+      failed_when: false
+      no_log: true
+
+    - name: Hysteria API | Read-only | Read sanitized creation status
+      ansible.builtin.command: "python3 -m json.tool {{ x_ui_hysteria_status_path }}"
+      register: x_ui_hysteria_create_status
+      changed_when: false
+
+    - name: Hysteria API | Guard | Require successful Hysteria2 API create
+      ansible.builtin.assert:
+        that:
+          - (x_ui_hysteria_create_status.stdout | from_json).created | bool
+          - (x_ui_hysteria_create_status.stdout | from_json).created_ports | sort == x_ui_hysteria_ports | sort
+        fail_msg: "3x-ui Hysteria2 API create failed: {{ (x_ui_hysteria_create_status.stdout | from_json).error | default('unknown') }}"
+
+    - name: Hysteria API | Read-only | Verify created Hysteria2 shape through API
+      ansible.builtin.shell: |
+        python3 - <<'PY'
+        import json
+        import os
+        import ssl
+        import urllib.request
+
+        requested_ports = set({{ x_ui_hysteria_ports | to_json }})
+        env = {}
+        for path in ['{{ x_ui_default_env_path }}', '{{ x_ui_install_env_path }}']:
+            if os.path.exists(path):
+                with open(path, encoding='utf-8', errors='replace') as handle:
+                    for raw_line in handle:
+                        line = raw_line.strip()
+                        if line and not line.startswith('#') and '=' in line:
+                            key, value = line.split('=', 1)
+                            env[key.strip()] = value.strip().strip('"').strip("'")
+        token = env.get('XUI_API_TOKEN') or ''
+        base_path = env.get('XUI_WEB_BASE_PATH') or '/'
+        if not base_path.startswith('/'):
+            base_path = '/' + base_path
+        if not base_path.endswith('/'):
+            base_path += '/'
+        context = ssl._create_unverified_context()
+        opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=context))
+
+        def extract_list(text):
+            parsed = json.loads(text or '{}')
+            obj = parsed.get('obj') if isinstance(parsed, dict) else parsed
+            return obj if isinstance(obj, list) else []
+
+        for scheme in ['https', 'http']:
+            root = f'{scheme}://127.0.0.1:{{ x_ui_hysteria_metadata.panel_port }}{base_path}'
+            try:
+                req = urllib.request.Request(root + 'panel/api/inbounds/list', headers={'Authorization': 'Bearer ' + token}, method='GET')
+                resp = opener.open(req, timeout=15)
+                items = extract_list(resp.read().decode('utf-8', 'replace'))
+                summaries = []
+                for item in items:
+                    if (
+                        not isinstance(item, dict)
+                        or item.get('port') not in requested_ports
+                        or str(item.get('protocol') or '').lower() not in ('hysteria', 'hysteria2')
+                    ):
+                        continue
+                    settings = item.get('settings') or {}
+                    stream = item.get('streamSettings') or {}
+                    sniffing = item.get('sniffing') or {}
+                    if isinstance(settings, str):
+                        settings = json.loads(settings or '{}')
+                    if isinstance(stream, str):
+                        stream = json.loads(stream or '{}')
+                    if isinstance(sniffing, str):
+                        sniffing = json.loads(sniffing or '{}')
+                    hysteria = stream.get('hysteriaSettings') or {}
+                    tls = stream.get('tlsSettings') or {}
+                    summaries.append({
+                        'port': item.get('port'),
+                        'protocol': item.get('protocol'),
+                        'network': stream.get('network'),
+                        'security': stream.get('security'),
+                        'hysteria_version': hysteria.get('version'),
+                        'udp_idle_timeout': hysteria.get('udpIdleTimeout'),
+                        'alpn': tls.get('alpn') or [],
+                        'client_count': len(settings.get('clients') or []),
+                        'sniffing_enabled': bool(sniffing.get('enabled')),
+                    })
+                print(json.dumps({'inbounds': sorted(summaries, key=lambda item: item['port'])}, sort_keys=True))
+                raise SystemExit(0)
+            except Exception:
+                continue
+        raise SystemExit(1)
+        PY
+      register: x_ui_hysteria_verify_raw
+      changed_when: false
+      no_log: true
+
+    - name: Hysteria API | Sanitized output | Store created Hysteria2 summary
+      ansible.builtin.set_fact:
+        x_ui_hysteria_verify: "{{ x_ui_hysteria_verify_raw.stdout | from_json }}"
+
+    - name: Hysteria API | Sanitized output | Show created Hysteria2 summary
+      ansible.builtin.debug:
+        msg:
+          host: "{{ inventory_hostname }}"
+          inbounds: "{{ x_ui_hysteria_verify.inbounds }}"
+
+    - name: Hysteria API | Guard | Require desired Hysteria2 shape
+      ansible.builtin.assert:
+        that:
+          - x_ui_hysteria_verify.inbounds | length == x_ui_hysteria_ports | length
+          - x_ui_hysteria_verify.inbounds | map(attribute='protocol') | unique | list == ['hysteria']
+          - x_ui_hysteria_verify.inbounds | map(attribute='network') | unique | list == ['hysteria']
+          - x_ui_hysteria_verify.inbounds | map(attribute='security') | unique | list == ['tls']
+          - x_ui_hysteria_verify.inbounds | map(attribute='hysteria_version') | unique | list == [2]
+          - x_ui_hysteria_verify.inbounds | map(attribute='client_count') | max == 0
+        fail_msg: "Created Hysteria2 inbound shape does not match desired empty inbound state."
+
+    - name: Hysteria API | Read-only | Verify x-ui service after creation
+      ansible.builtin.command: systemctl --no-pager is-active x-ui.service
+      register: x_ui_hysteria_service_active
+      changed_when: false
+
+    - name: Hysteria API | Sanitized output | Show final service state
+      ansible.builtin.debug:
+        msg:
+          host: "{{ inventory_hostname }}"
+          x_ui_service_active: "{{ x_ui_hysteria_service_active.stdout }}"

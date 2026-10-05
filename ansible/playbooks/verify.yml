@@ -1,0 +1,139 @@
+---
+- name: Verify standalone panel and proxy state without changing it
+  hosts: standalone
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Require one host
+      ansible.builtin.assert:
+        that:
+          - ansible_limit == 'standalone'
+          - ansible_play_hosts_all | length == 1
+          - ansible_user == ops_user
+          - ansible_port | int == target_ssh_port | int
+
+    - name: Inspect local listeners and UFW without printing secrets
+      ansible.builtin.shell: |
+        python3 - <<'PY'
+        import json
+        import subprocess
+
+        def output(*args):
+            result = subprocess.run(args, capture_output=True, text=True, check=True, timeout=15)
+            return result.stdout
+
+        tcp = output('ss', '-H', '-ltn')
+        udp = output('ss', '-H', '-lun')
+        firewall = output('ufw', 'status', 'verbose')
+        sshd = output('/usr/sbin/sshd', '-T')
+        active = {name: subprocess.run(['systemctl', 'is-active', name], capture_output=True, text=True, timeout=10).stdout.strip() == 'active'
+                  for name in ['x-ui.service', 'nginx.service']}
+        def present(text, port):
+            import re
+            return bool(re.search(r'(?<![0-9]):' + str(port) + r'\b', text))
+
+        print(json.dumps({
+            'tcp': {str(p): present(tcp, p) for p in [{{ target_ssh_port }}, {{ panel_port }}, {{ subscription_port }}, {{ vless_port }}]},
+            'udp_hysteria': present(udp, {{ hysteria_port }}),
+            'ufw_active': 'Status: active' in firewall,
+            'panel_public_rule': any(str({{ panel_port }}) + '/tcp' in line and 'Anywhere' in line and 'ALLOW' in line for line in firewall.splitlines()),
+            'ssh_key_only': all(item in sshd for item in ['passwordauthentication no', 'kbdinteractiveauthentication no', 'permitrootlogin no']),
+            'services': active,
+        }, sort_keys=True))
+        PY
+      args:
+        executable: /bin/bash
+      register: verify_runtime_raw
+      changed_when: false
+
+    - name: Parse runtime summary
+      ansible.builtin.set_fact:
+        verify_runtime: "{{ verify_runtime_raw.stdout | from_json }}"
+
+    - name: Require expected listeners, restricted panel and services
+      ansible.builtin.assert:
+        that:
+          - verify_runtime.tcp[target_ssh_port | string] | bool
+          - verify_runtime.tcp[panel_port | string] | bool
+          - verify_runtime.tcp[subscription_port | string] | bool
+          - verify_runtime.tcp[vless_port | string] | bool
+          - not (enable_hysteria | bool) or verify_runtime.udp_hysteria | bool
+          - verify_runtime.ufw_active | bool
+          - not verify_runtime.panel_public_rule | bool
+          - verify_runtime.ssh_key_only | bool
+          - verify_runtime.services['x-ui.service'] | bool
+          - verify_runtime.services['nginx.service'] | bool
+
+    - name: Inspect SQLite subscription and API inbound shapes
+      ansible.builtin.shell: |
+        python3 - <<'PY'
+        import json
+        import os
+        import re
+        import sqlite3
+        import ssl
+        import urllib.request
+
+        env = {}
+        for path in ['/etc/default/x-ui', '/etc/x-ui/install-result.env']:
+            if os.path.exists(path):
+                for line in open(path, encoding='utf-8', errors='replace'):
+                    if '=' in line and not line.lstrip().startswith('#'):
+                        key, value = line.strip().split('=', 1)
+                        env[key] = value.strip().strip('"').strip("'")
+        conn = sqlite3.connect('/etc/x-ui/x-ui.db')
+        settings = dict(conn.execute("select key, value from settings where key in ('subEnable','subPort')"))
+        conn.close()
+        port = env.get('XUI_PANEL_PORT', '{{ panel_port }}')
+        base = env.get('XUI_WEB_BASE_PATH', '/')
+        base = '/' + base.strip('/') + '/' if base.strip('/') else '/'
+        token = env.get('XUI_API_TOKEN', '')
+        if not token:
+            raise SystemExit('Bearer API token missing')
+        endpoints = [f'https://127.0.0.1:{port}{base}', f'http://127.0.0.1:{port}{base}']
+        response = None
+        for endpoint in endpoints:
+            try:
+                req = urllib.request.Request(endpoint + 'panel/api/inbounds/list', headers={'Authorization': 'Bearer ' + token})
+                response = json.load(urllib.request.urlopen(req, context=ssl._create_unverified_context(), timeout=10))
+                break
+            except Exception:
+                continue
+        if response is None:
+            raise SystemExit('Local bearer API unavailable')
+        inbounds = response.get('obj') if isinstance(response, dict) else []
+        inbounds = inbounds if isinstance(inbounds, list) else []
+        vless = [item for item in inbounds if str(item.get('protocol', '')).lower() == 'vless' and int(item.get('port') or 0) == {{ vless_port }}]
+        hysteria = [item for item in inbounds if str(item.get('protocol', '')).lower() in ('hysteria', 'hysteria2') and int(item.get('port') or 0) == {{ hysteria_port }}]
+        print(json.dumps({
+            'subscription_enabled': str(settings.get('subEnable', '')).lower() in ('true', '1'),
+            'subscription_port_matches': str(settings.get('subPort', '')) == '{{ subscription_port }}',
+            'vless_count': len(vless), 'hysteria_count': len(hysteria),
+            'inbound_count': len(inbounds),
+        }, sort_keys=True))
+        PY
+      args:
+        executable: /bin/bash
+      register: verify_panel_raw
+      changed_when: false
+      no_log: true
+
+    - name: Parse sanitized panel summary
+      ansible.builtin.set_fact:
+        verify_panel: "{{ verify_panel_raw.stdout | from_json }}"
+
+    - name: Require selected 3x-ui settings and inbounds
+      ansible.builtin.assert:
+        that:
+          - verify_panel.subscription_enabled | bool
+          - verify_panel.subscription_port_matches | bool
+          - verify_panel.vless_count | int == 1
+          - not (enable_hysteria | bool) or verify_panel.hysteria_count | int == 1
+          - enable_hysteria | bool or verify_panel.hysteria_count | int == 0
+        fail_msg: Standalone panel state differs from the reviewed .env plan.
+
+    - name: Report sanitized state
+      ansible.builtin.debug:
+        msg:
+          runtime: "{{ verify_runtime }}"
+          panel: "{{ verify_panel }}"

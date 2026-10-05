@@ -1,0 +1,6 @@
+.env*
+!.env.example
+.local/
+__pycache__/
+.pytest_cache/
+*.retry

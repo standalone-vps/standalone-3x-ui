@@ -1,0 +1,158 @@
+---
+- name: Finalize key-only SSH after a separate target-port probe
+  hosts: standalone
+  gather_facts: false
+  become: true
+  vars:
+    cutover_approved: false
+  pre_tasks:
+    - name: Require verified target-port operations connection
+      ansible.builtin.assert:
+        that:
+          - ansible_limit == 'standalone'
+          - ansible_play_hosts_all | length == 1
+          - cutover_approved | bool
+          - ansible_user == ops_user
+          - ansible_port | int == target_ssh_port | int
+        fail_msg: Refusing SSH cutover before a separate key-only target-port connection.
+
+  tasks:
+    - name: Configure key-only operations access
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/00-standalone-auth.conf
+        content: |
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          PermitRootLogin no
+          X11Forwarding no
+          AllowUsers {{ ops_user }}
+        owner: root
+        group: root
+        mode: '0644'
+        validate: /usr/sbin/sshd -t -f %s
+      notify: Reload SSH
+
+    - name: Keep only the verified SSH port
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/99-standalone-ports.conf
+        content: "Port {{ target_ssh_port }}\n"
+        owner: root
+        group: root
+        mode: '0644'
+        validate: /usr/sbin/sshd -t -f %s
+      notify: Reload SSH
+
+    - name: Check SSH socket activation
+      ansible.builtin.command: systemctl is-active ssh.socket
+      register: cutover_socket_active
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Keep only verified SSH socket port
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/ssh.socket.d/99-standalone-ports.conf
+        content: |
+          [Socket]
+          ListenStream=
+          ListenStream={{ target_ssh_port }}
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Restart SSH socket
+      when: cutover_socket_active.rc == 0
+
+    - name: Activate target-only SSH before closing old UFW access
+      ansible.builtin.meta: flush_handlers
+
+    - name: Verify effective key-only SSH settings
+      ansible.builtin.command: /usr/sbin/sshd -T
+      register: cutover_effective
+      changed_when: false
+      check_mode: false
+
+    - name: Require target listener and secure authentication
+      ansible.builtin.assert:
+        that:
+          - "'port ' ~ (target_ssh_port | string) in cutover_effective.stdout"
+          - "current_ssh_port | int == target_ssh_port | int or ('port ' ~ (current_ssh_port | string)) not in cutover_effective.stdout"
+          - "'passwordauthentication no' in cutover_effective.stdout"
+          - "'permitrootlogin no' in cutover_effective.stdout"
+          - "'kbdinteractiveauthentication no' in cutover_effective.stdout"
+      when: not ansible_check_mode
+
+    - name: Configure fail2ban for the verified SSH port
+      ansible.builtin.copy:
+        dest: /etc/fail2ban/jail.d/sshd-standalone.local
+        content: |
+          [sshd]
+          enabled = true
+          backend = systemd
+          port = {{ target_ssh_port }}
+        owner: root
+        group: root
+        mode: '0644'
+      register: cutover_fail2ban_jail
+
+    - name: Start fail2ban with the selected SSH port
+      ansible.builtin.systemd_service:
+        name: fail2ban.service
+        enabled: true
+        state: restarted
+      when:
+        - not ansible_check_mode
+        - cutover_fail2ban_jail.changed
+
+    - name: Remove old SSH UFW allow when port changed
+      ansible.builtin.command: "ufw --force delete allow {{ current_ssh_port }}/tcp"
+      register: cutover_ufw_delete
+      changed_when: cutover_ufw_delete.rc == 0
+      failed_when: >-
+        cutover_ufw_delete.rc != 0 and
+        'could not delete non-existent rule' not in (cutover_ufw_delete.stderr | lower)
+      when:
+        - current_ssh_port | int != target_ssh_port | int
+        - not ansible_check_mode
+
+    - name: Remove generic OpenSSH firewall profile after moving from port 22
+      ansible.builtin.command: ufw --force delete allow OpenSSH
+      register: cutover_open_ssh_delete
+      changed_when: cutover_open_ssh_delete.rc == 0
+      failed_when: false
+      when:
+        - current_ssh_port | int == 22
+        - target_ssh_port | int != 22
+        - not ansible_check_mode
+
+    - name: Check final UFW rules after SSH cutover
+      ansible.builtin.command: ufw status verbose
+      register: cutover_ufw_final
+      changed_when: false
+      check_mode: false
+
+    - name: Require active firewall and closed old SSH rule
+      ansible.builtin.assert:
+        that:
+          - "'Status: active' in cutover_ufw_final.stdout"
+          - >-
+            current_ssh_port | int == target_ssh_port | int or
+            (cutover_ufw_final.stdout_lines | select('match', '^' ~ (current_ssh_port | string) ~ '/tcp ') | list | length) == 0
+          - >-
+            current_ssh_port | int != 22 or target_ssh_port | int == 22 or
+            (cutover_ufw_final.stdout_lines | select('match', '^OpenSSH ') | list | length) == 0
+        fail_msg: Old SSH UFW allow remains; inspect rules from the provider console.
+      when: not ansible_check_mode
+
+  handlers:
+    - name: Reload SSH
+      ansible.builtin.systemd_service:
+        name: ssh.service
+        state: reloaded
+      when: not ansible_check_mode
+
+    - name: Restart SSH socket
+      ansible.builtin.systemd_service:
+        name: ssh.socket
+        daemon_reload: true
+        state: restarted
+      when: not ansible_check_mode

@@ -1,0 +1,263 @@
+---
+- name: Install 3x-ui on one proxy node
+  hosts: all
+  gather_facts: true
+  become: true
+  vars:
+    x_ui_version: v3.7.0
+    allow_x_ui_reinstall: false
+    # SHA256 of upstream install.sh at the exact release tag; review before adding a version.
+    x_ui_install_sha256_by_version:
+      v3.6.0: 7bb41e811f2107a3182da9090f24893d3612b5b6310194a7dd1f9965ff29e0c8
+      v3.7.0: a7f4fedcea3abe8987508d00f29834b8872e4e4e5059159eb19460d474b37cdc
+    x_ui_install_script_path: /tmp/3x-ui-install.sh
+    x_ui_install_log_path: /root/3x-ui-install.log
+    x_ui_database_path: /etc/x-ui/x-ui.db
+    x_ui_default_env_path: /etc/default/x-ui
+    x_ui_install_env_path: /etc/x-ui/install-result.env
+    x_ui_backup_dir: /root
+    x_ui_panel_port: "{{ panel_port | default(39089) }}"
+    x_ui_install_db_type: >-
+      {{ 'postgres' if (x_ui_db_backend | default('sqlite')) in ['postgres', 'postgresql'] else 'sqlite' }}
+  pre_tasks:
+    - name: Require an explicit single-host limit for 3x-ui install
+      ansible.builtin.assert:
+        that:
+          - ansible_limit is defined
+          - ansible_limit | length > 0
+          - ansible_play_hosts_all | length == 1
+        fail_msg: "3x-ui installation is mutating. Run with an explicit single-host --limit standalone."
+
+    - name: Require an approved exact 3x-ui installer tag and SHA256
+      ansible.builtin.assert:
+        that:
+          - x_ui_version | string | trim | length > 0
+          - (x_ui_version | string | lower) not in ['main', 'master', 'latest', 'head']
+          - x_ui_version in x_ui_install_sha256_by_version
+          - x_ui_install_sha256_by_version.get(x_ui_version, '') is match('^[0-9a-f]{64}$')
+        fail_msg: "3x-ui installer version must be an approved exact tag with a valid SHA256."
+
+    - name: Require Ubuntu target
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution == 'Ubuntu'
+          - ansible_distribution_major_version | int == 24
+        fail_msg: "This install path is currently validated only for Ubuntu 24.04 targets."
+
+    - name: Check existing x-ui binary
+      ansible.builtin.stat:
+        path: /usr/local/x-ui/x-ui
+      register: x_ui_binary
+
+    - name: Refuse reinstall unless explicitly approved
+      ansible.builtin.assert:
+        that:
+          - not x_ui_binary.stat.exists or allow_x_ui_reinstall | bool
+        fail_msg: "3x-ui is already installed. Re-run only with -e allow_x_ui_reinstall=true after backup/review."
+
+    - name: Show rollback note
+      ansible.builtin.debug:
+        msg:
+          - "Rollback: use the provider console if SSH is lost; uninstall with x-ui uninstall only after exporting/restoring required panel data."
+          - "Installer credentials are written on the host under /etc/x-ui/install-result.env and are intentionally not printed by this playbook."
+          - "Existing SQLite/PostgreSQL database is backed up on host before approved reinstall/update when present."
+
+    - name: Detect existing x-ui database backend before approved reinstall
+      ansible.builtin.shell: |
+        python3 - <<'PY'
+        import json
+        import os
+
+        def read_env(path):
+            values = {}
+            if not os.path.exists(path):
+                return values
+            with open(path, encoding='utf-8', errors='replace') as handle:
+                for raw_line in handle:
+                    line = raw_line.strip()
+                    if line and not line.startswith('#') and '=' in line:
+                        key, value = line.split('=', 1)
+                        values[key.strip()] = value.strip().strip('"').strip("'")
+            return values
+
+        default_env = read_env('{{ x_ui_default_env_path }}')
+        install_env = read_env('{{ x_ui_install_env_path }}')
+        backend = (default_env.get('XUI_DB_TYPE') or install_env.get('XUI_DB_TYPE') or 'sqlite').strip().lower() or 'sqlite'
+        if backend == 'sqlite3':
+            backend = 'sqlite'
+        if backend == 'postgresql':
+            backend = 'postgres'
+        print(json.dumps({'backend_detected': backend, 'backend_declared': '{{ x_ui_db_backend | default("") }}'}, sort_keys=True))
+        PY
+      args:
+        executable: /bin/bash
+      register: x_ui_existing_backend_raw
+      check_mode: false
+      changed_when: false
+      no_log: true
+      when:
+        - x_ui_binary.stat.exists
+        - allow_x_ui_reinstall | bool
+
+    - name: Store existing x-ui database backend summary
+      ansible.builtin.set_fact:
+        x_ui_existing_backend: "{{ x_ui_existing_backend_raw.stdout | from_json }}"
+      no_log: true
+      when:
+        - x_ui_binary.stat.exists
+        - allow_x_ui_reinstall | bool
+
+    - name: Require declared backend to match runtime before approved reinstall
+      ansible.builtin.assert:
+        that:
+          - x_ui_db_backend is defined
+          - x_ui_db_backend in ['sqlite', 'sqlite3', 'postgres', 'postgresql']
+          - >-
+            (x_ui_existing_backend.backend_declared in ['sqlite', 'sqlite3'] and x_ui_existing_backend.backend_detected == 'sqlite') or
+            (x_ui_existing_backend.backend_declared in ['postgres', 'postgresql'] and x_ui_existing_backend.backend_detected == 'postgres')
+        fail_msg: "Inventory x_ui_db_backend must match existing runtime backend before approved 3x-ui reinstall."
+      when:
+        - x_ui_binary.stat.exists
+        - allow_x_ui_reinstall | bool
+
+    - name: Check existing x-ui SQLite database
+      ansible.builtin.stat:
+        path: "{{ x_ui_database_path }}"
+      register: x_ui_database
+
+    - name: Back up existing x-ui SQLite database before approved reinstall/update
+      ansible.builtin.shell: |
+        python3 - <<'PY'
+        import os
+        import sqlite3
+
+        source_path = '{{ x_ui_database_path }}'
+        backup_path = '{{ x_ui_backup_dir }}/x-ui-backup-before-update-{{ ansible_date_time.iso8601_basic_short }}.db'
+        source = sqlite3.connect(source_path)
+        backup = sqlite3.connect(backup_path)
+        try:
+            source.backup(backup)
+        finally:
+            backup.close()
+            source.close()
+        os.chmod(backup_path, 0o600)
+        print(backup_path)
+        PY
+      args:
+        executable: /bin/bash
+      register: x_ui_database_backup
+      changed_when: true
+      no_log: true
+      when:
+        - x_ui_binary.stat.exists
+        - allow_x_ui_reinstall | bool
+        - x_ui_existing_backend.backend_detected == 'sqlite'
+        - x_ui_database.stat.exists
+
+    - name: Back up existing x-ui PostgreSQL database before approved reinstall/update
+      ansible.builtin.shell: |
+        python3 - <<'PY'
+        import os
+        import subprocess
+        import urllib.parse
+
+        env_values = {}
+        for path in ['{{ x_ui_default_env_path }}', '{{ x_ui_install_env_path }}']:
+            if os.path.exists(path):
+                with open(path, encoding='utf-8', errors='replace') as handle:
+                    for raw_line in handle:
+                        line = raw_line.strip()
+                        if line and not line.startswith('#') and '=' in line:
+                            key, value = line.split('=', 1)
+                            env_values[key.strip()] = value.strip().strip('"').strip("'")
+        dsn = env_values.get('XUI_DB_DSN') or ''
+        if not dsn:
+            raise SystemExit('XUI_DB_DSN missing')
+        parsed = urllib.parse.urlparse(dsn)
+        pg_env = os.environ.copy()
+        pg_env.update({
+            'PGHOST': parsed.hostname or '',
+            'PGPORT': str(parsed.port or 5432),
+            'PGUSER': urllib.parse.unquote(parsed.username or ''),
+            'PGPASSWORD': urllib.parse.unquote(parsed.password or ''),
+            'PGDATABASE': (parsed.path or '/').lstrip('/'),
+            'PGCONNECT_TIMEOUT': '10',
+        })
+        backup_path = '{{ x_ui_backup_dir }}/x-ui-postgres-backup-before-update-{{ ansible_date_time.iso8601_basic_short }}.sql'
+        with open(backup_path, 'w', encoding='utf-8') as handle:
+            result = subprocess.run(['pg_dump', '--no-owner', '--no-privileges'], text=True, stdout=handle, stderr=subprocess.PIPE, env=pg_env, check=False, timeout=60)
+        os.chmod(backup_path, 0o600)
+        if result.returncode != 0:
+            raise SystemExit('pg_dump failed')
+        print(backup_path)
+        PY
+      args:
+        executable: /bin/bash
+      register: x_ui_postgres_backup
+      changed_when: true
+      no_log: true
+      when:
+        - x_ui_binary.stat.exists
+        - allow_x_ui_reinstall | bool
+        - x_ui_existing_backend.backend_detected == 'postgres'
+
+    - name: Show x-ui database backup status
+      ansible.builtin.debug:
+        msg:
+          database_backup_created: >-
+            {{ x_ui_postgres_backup.changed | default(false) if x_ui_existing_backend.backend_detected == 'postgres'
+               else x_ui_database_backup.changed | default(false) }}
+          database_backup_path: >-
+            {{ x_ui_postgres_backup.stdout | default('not-created') if x_ui_existing_backend.backend_detected == 'postgres'
+               else x_ui_database_backup.stdout | default('not-created') }}
+      when:
+        - x_ui_binary.stat.exists
+        - allow_x_ui_reinstall | bool
+
+  tasks:
+    - name: Download 3x-ui installer
+      ansible.builtin.get_url:
+        url: "https://raw.githubusercontent.com/MHSanaei/3x-ui/{{ x_ui_version }}/install.sh"
+        dest: "{{ x_ui_install_script_path }}"
+        checksum: "sha256:{{ x_ui_install_sha256_by_version[x_ui_version] }}"
+        mode: '0755'
+
+    - name: Install 3x-ui non-interactively
+      ansible.builtin.shell:
+        cmd: "XUI_NONINTERACTIVE=1 timeout 1800 bash {{ x_ui_install_script_path }} {{ x_ui_version }} >{{ x_ui_install_log_path }} 2>&1"
+      environment:
+        XUI_NONINTERACTIVE: "1"
+        XUI_DB_TYPE: "{{ x_ui_install_db_type }}"
+        XUI_PANEL_PORT: "{{ x_ui_panel_port | string }}"
+        XUI_SSL_MODE: none
+      register: x_ui_install_result
+      changed_when: true
+      no_log: true
+
+    - name: Ensure x-ui service is enabled and running
+      ansible.builtin.systemd_service:
+        name: x-ui.service
+        enabled: true
+        state: started
+      # Check mode does not execute the installer, so an empty node has no service yet.
+      when: not ansible_check_mode or x_ui_binary.stat.exists
+
+    - name: Verify installed 3x-ui version
+      ansible.builtin.command: /usr/local/x-ui/x-ui -v
+      register: x_ui_installed_version
+      changed_when: false
+      when: not ansible_check_mode or x_ui_binary.stat.exists
+
+    - name: Verify x-ui service status
+      ansible.builtin.command: systemctl --no-pager is-active x-ui.service
+      register: x_ui_service_active
+      changed_when: false
+      when: not ansible_check_mode or x_ui_binary.stat.exists
+
+    - name: Show install verification
+      ansible.builtin.debug:
+        msg:
+          host: "{{ inventory_hostname }}"
+          x_ui_version: "{{ x_ui_installed_version.stdout | default('planned-in-check-mode') }}"
+          x_ui_service_active: "{{ x_ui_service_active.stdout | default('planned-in-check-mode') }}"
+          credentials_file: /etc/x-ui/install-result.env

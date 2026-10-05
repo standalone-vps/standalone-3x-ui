@@ -1,0 +1,62 @@
+---
+- name: Create a key based administrator from provider root access
+  hosts: standalone
+  gather_facts: false
+  become: false
+  vars:
+    bootstrap_approved: false
+  pre_tasks:
+    - name: Require explicit one-host scope and approval
+      ansible.builtin.assert:
+        that:
+          - ansible_limit is defined
+          - ansible_limit == 'standalone'
+          - ansible_play_hosts_all | length == 1
+          - bootstrap_approved | bool
+          - ansible_user == 'root'
+          - ops_user is match('^[a-z_][a-z0-9_-]{0,31}$')
+          - ops_user != 'root'
+          - ops_public_key is match('^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp[0-9]+) ')
+        fail_msg: Bootstrap requires one root host, an approved operations user and a public key.
+  tasks:
+    - name: Create operations account
+      ansible.builtin.user:
+        name: "{{ ops_user }}"
+        shell: /bin/bash
+        create_home: true
+        groups: sudo
+        append: true
+        state: present
+
+    - name: Create SSH directory
+      ansible.builtin.file:
+        path: "/home/{{ ops_user }}/.ssh"
+        state: directory
+        owner: "{{ ops_user }}"
+        group: "{{ ops_user }}"
+        mode: '0700'
+
+    - name: Install public key
+      ansible.builtin.lineinfile:
+        path: "/home/{{ ops_user }}/.ssh/authorized_keys"
+        line: "{{ ops_public_key }}"
+        create: true
+        owner: "{{ ops_user }}"
+        group: "{{ ops_user }}"
+        mode: '0600'
+
+    - name: Permit passwordless sudo to operations account
+      ansible.builtin.copy:
+        dest: "/etc/sudoers.d/90-standalone-{{ ops_user }}"
+        content: "{{ ops_user }} ALL=(ALL:ALL) NOPASSWD:ALL\n"
+        owner: root
+        group: root
+        mode: '0440'
+        validate: /usr/sbin/visudo -cf %s
+
+    - name: Verify passwordless sudo as the operations account
+      ansible.builtin.command: sudo -n true
+      become: true
+      become_user: "{{ ops_user }}"
+      changed_when: false
+

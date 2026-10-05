@@ -1,0 +1,174 @@
+---
+- name: Prepare SSH and firewall before changing authentication
+  hosts: standalone
+  gather_facts: true
+  become: true
+  vars:
+    network_approved: false
+  pre_tasks:
+    - name: Require one reviewed Ubuntu VPS
+      ansible.builtin.assert:
+        that:
+          - ansible_limit == 'standalone'
+          - ansible_play_hosts_all | length == 1
+          - network_approved | bool
+          - ansible_distribution == 'Ubuntu'
+          - ansible_distribution_version is version('24.04', '>=')
+          - ansible_distribution_version is version('25.00', '<')
+          - ansible_user == ops_user
+          - current_ssh_port | int >= 1
+          - target_ssh_port | int >= 1
+          - panel_allowed_cidrs | length > 0
+        fail_msg: Review the one-host plan and panel source allowlist before UFW changes.
+
+    - name: Confirm existing SSH session uses the configured port
+      ansible.builtin.assert:
+        that:
+          - ansible_port | int == current_ssh_port | int
+
+  tasks:
+    - name: Install host packages
+      ansible.builtin.apt:
+        name: [ufw, fail2ban, ca-certificates, curl, unattended-upgrades]
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Read UFW state
+      ansible.builtin.command: ufw status verbose
+      changed_when: false
+      failed_when: false
+      register: network_ufw_before
+      check_mode: false
+
+    - name: Set incoming policy
+      ansible.builtin.command: ufw default deny incoming
+      when:
+        - not ansible_check_mode
+        - "'deny (incoming)' not in network_ufw_before.stdout | lower"
+      changed_when: true
+
+    - name: Set outgoing policy
+      ansible.builtin.command: ufw default allow outgoing
+      when:
+        - not ansible_check_mode
+        - "'allow (outgoing)' not in network_ufw_before.stdout | lower"
+      changed_when: true
+
+    - name: Open current and chosen SSH ports before changing listeners
+      ansible.builtin.command: "ufw allow {{ item }}/tcp"
+      loop: "{{ [current_ssh_port | int, target_ssh_port | int] | unique | list }}"
+      register: network_ssh_allow
+      changed_when: "'rule added' in network_ssh_allow.stdout | lower or 'rules updated' in network_ssh_allow.stdout | lower"
+      when: not ansible_check_mode
+
+    - name: Open certificate, subscription and VLESS TCP ports
+      ansible.builtin.command: "ufw allow {{ item }}/tcp"
+      loop: "{{ [80, subscription_port | int, vless_port | int] | unique | list }}"
+      register: network_tcp_allow
+      changed_when: "'rule added' in network_tcp_allow.stdout | lower or 'rules updated' in network_tcp_allow.stdout | lower"
+      when: not ansible_check_mode
+
+    - name: Open Hysteria2 UDP port only when selected
+      ansible.builtin.command: "ufw allow {{ hysteria_port }}/udp"
+      register: network_udp_allow
+      changed_when: "'rule added' in network_udp_allow.stdout | lower or 'rules updated' in network_udp_allow.stdout | lower"
+      when:
+        - enable_hysteria | bool
+        - not ansible_check_mode
+
+    - name: Restrict administrator panel to reviewed sources
+      ansible.builtin.command: "ufw allow from {{ item }} to any port {{ panel_port }} proto tcp"
+      loop: "{{ panel_allowed_cidrs }}"
+      register: network_panel_allow
+      changed_when: "'rule added' in network_panel_allow.stdout | lower or 'rules updated' in network_panel_allow.stdout | lower"
+      when: not ansible_check_mode
+
+    - name: Enable UFW after all access rules are present
+      ansible.builtin.command: ufw --force enable
+      changed_when: true
+      when:
+        - not ansible_check_mode
+        - "'status: inactive' in network_ufw_before.stdout | lower"
+
+    - name: Ensure SSH config directory exists
+      ansible.builtin.file:
+        path: /etc/ssh/sshd_config.d
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Add chosen SSH port while retaining current port
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/99-standalone-ports.conf
+        content: |
+          # Managed by standalone-3x-ui. The current port is kept until independently verified.
+          Port {{ current_ssh_port }}
+          {% if target_ssh_port | int != current_ssh_port | int %}Port {{ target_ssh_port }}
+          {% endif %}
+        owner: root
+        group: root
+        mode: '0644'
+        validate: /usr/sbin/sshd -t -f %s
+      notify: Reload SSH
+
+    - name: Check SSH socket activation
+      ansible.builtin.command: systemctl is-active ssh.socket
+      register: network_socket_active
+      failed_when: false
+      changed_when: false
+      check_mode: false
+
+    - name: Create SSH socket drop-in directory
+      ansible.builtin.file:
+        path: /etc/systemd/system/ssh.socket.d
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      when: network_socket_active.rc == 0
+
+    - name: Add chosen SSH socket port while retaining current port
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/ssh.socket.d/99-standalone-ports.conf
+        content: |
+          [Socket]
+          ListenStream=
+          ListenStream={{ current_ssh_port }}
+          {% if target_ssh_port | int != current_ssh_port | int %}ListenStream={{ target_ssh_port }}
+          {% endif %}
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Restart SSH socket
+      when: network_socket_active.rc == 0
+
+    - name: Apply SSH listeners before independent probe
+      ansible.builtin.meta: flush_handlers
+
+    - name: Verify active UFW state
+      ansible.builtin.command: ufw status verbose
+      register: network_ufw_after
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Require active UFW after apply
+      ansible.builtin.assert:
+        that: "'Status: active' in network_ufw_after.stdout"
+      when: not ansible_check_mode
+
+  handlers:
+    - name: Reload SSH
+      ansible.builtin.systemd_service:
+        name: ssh.service
+        state: reloaded
+      when: not ansible_check_mode
+
+    - name: Restart SSH socket
+      ansible.builtin.systemd_service:
+        name: ssh.socket
+        daemon_reload: true
+        state: restarted
+      when: not ansible_check_mode
