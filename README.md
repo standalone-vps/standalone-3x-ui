@@ -1,55 +1,230 @@
-# Standalone 3x-ui VPS
+# Set up a new 3x-ui VPS
 
-**Documentation in Russian:** [README.ru.md](README.ru.md). The English documentation is the default for this repository.
+[Читать по-русски](README.ru.md)
 
-Ansible control plane for **one new Ubuntu 24.04 VPS**. It starts with provider `root`/password access, establishes a key-only `ops` account with passwordless sudo, then installs a standalone 3x-ui panel, subscription endpoint, VLESS/TLS and optional Hysteria2. This VPS is its own controller; registration of future remote nodes is a later, separate operation.
+This guide starts with a **Linux computer** and a **new Ubuntu 24.04 VPS**. You can sign in to the VPS as `root` with a password over SSH. You will create an `ops` account, then install 3x-ui from your Linux computer.
 
-The source playbooks were adapted from `vps-fleet-ops` at repository creation. They retain explicit single-host scope, exact installer tag plus checksum, local bearer API, SQLite backup, and sanitized outputs. No existing fleet inventory or controller is needed.
+Run every command in the place named above its code block. Ansible is the program that runs the installation steps over SSH. Do not put passwords or private keys in `.env`.
 
-## Controller prerequisites
+```text
+Linux computer → SSH as root → create ops → test ops → install 3x-ui → test a client
+```
 
-- Python 3.10+, `ansible-core`, OpenSSH client and `ssh-keygen`; `sshpass` is required by Ansible's interactive `--ask-pass` bootstrap mode.
-- A new Ubuntu 24.04 VPS with working provider console, initial root/password access through SSH or that console, a public IPv4 address, and enough memory and disk for 3x-ui and Nginx.
-- A public DNS name resolving to the VPS. Confirm provider firewall allows the selected SSH, `80/tcp`, VLESS TCP, subscription TCP, and optional Hysteria UDP ports. Panel access should allow only the configured administration CIDRs.
-- Review the 3x-ui installer tag and SHA256 in `ansible/playbooks/3x-ui-install.yml` before deployment. This repository pins [`v3.9.0`](https://github.com/MHSanaei/3x-ui/releases/tag/v3.9.0), verified as GitHub's latest stable release on 2026-10-05; it does not silently select a newer release.
+## Before you start
 
-Real settings, credentials, backups and exports are excluded from Git. The root password is requested by Ansible at the terminal during bootstrap and is never stored in `.env`. Before bootstrap, compare the VPS SSH host-key fingerprint with the provider console and add the verified key to local `known_hosts`. Use the [console bootstrap guide](docs/bootstrap-console.md) if root SSH is disabled. The launcher uses `StrictHostKeyChecking=yes` and never auto-accepts a new host key.
+You need the VPS IP address, its `root` password, and a domain name pointing to that IP address. This guide uses SSH port `22`; replace it in SSH commands if your provider uses another port. Keep access to your provider's VPS recovery console in case SSH stops working.
 
-## First deployment
+Open a terminal **on your Linux computer** in the directory containing this README. If that computer uses Ubuntu or Debian, install the local tools:
 
-1. `cp .env.example .env` and edit `.env`. A Russian-commented template is also available as `.env.ru.example`. Choose a separate panel port and subscription port. `VLESS_PORT=443` is TCP; `HYSTERIA_PORT=443` is UDP, so the two may share the number. Set `ENABLE_HYSTERIA=no` to omit Hysteria2 and its UDP rule. If `CHANGE_SSH_PORT=no`, set `SSH_TARGET_PORT` equal to `BOOTSTRAP_SSH_PORT`; retaining SSH `22` is an explicit exception to the source fleet policy.
-2. `python3 bin/vps.py plan`. Review the displayed firewall plan, DNS, provider firewall, and console recovery access.
-3. Create and prepare a local SSH key using the separate [Linux/WSL](docs/ssh-keys-linux.md) or [Windows PowerShell](docs/ssh-keys-windows.md) guide, or point `SSH_KEY_PATH` at an existing key pair. On Linux/WSL, `python3 bin/vps.py keygen` is also available. Add a passphrase-protected key to `ssh-agent` before deployment. The private key never leaves your computer.
-4. Run `python3 bin/vps.py bootstrap --apply`. Ansible prompts for the initial root password. If the provider permits root access only through its console, follow [manual console bootstrap](docs/bootstrap-console.md) and then run `python3 bin/vps.py verify-access` after setting `CHANGE_SSH_PORT=no` and both SSH port values to the current port in `.env`. Restore the intended port settings before `check-network`. This creates the operations account, installs **only the public key**, writes a validated `sudoers.d` file, and probes a fresh key-only `sudo -n` login. The old root/password path is still available if this fails.
-5. Run `python3 bin/vps.py check-network`, then `python3 bin/vps.py deploy --apply`. Network setup opens both old and selected SSH ports before changing the listener. The launcher verifies the selected port in a separate SSH session, then disables root/password SSH and closes the old port. It then installs 3x-ui, token, loopback Nginx fallback, certificate, subscription, VLESS/TLS and optionally Hysteria2, followed by a local read-only verification.
-6. Run `python3 bin/vps.py verify` after installation and after a reboot. Inspect the panel credentials **on the VPS** from `/etc/x-ui/install-result.env` through the verified operations account; do not paste them into Git or chat.
+```sh
+sudo apt update
+sudo apt install -y ansible-core openssh-client python3 nano curl
+```
 
-`check-network` is a preview and cannot predict every runtime effect on an untouched host, especially if UFW is not yet installed. Do not mistake a check-mode result for an active listener or reachable provider port. Each mutating playbook uses `--limit standalone`. The launcher passes only non-secret deployment values through a temporary mode-0600 vars file, which is removed after each playbook. API tokens and generated credentials remain on the VPS.
+Other Linux distributions need the same tools from their own package manager. Check that you are in the repository directory:
 
-## Client acceptance test
+```sh
+ls bin/vps.py
+```
 
-1. Reach the administration panel only from `PANEL_ALLOWED_CIDRS` or through an SSH tunnel. Confirm its certificate and login.
-2. In the panel, inspect the VLESS/TLS inbound on the selected TCP port. If enabled, inspect the Hysteria2 inbound on the selected UDP port. Create one temporary client on each selected inbound, then obtain its connection link from the panel.
-3. From an **external** client network, import the link and verify authenticated proxy traffic over VLESS/TLS and Hysteria2 (if enabled). Check both IPv4 reachability and the DNS/certificate name.
-4. Open the subscription URL shown by the panel, confirm that it contains only the intended clients and protocols, and refresh it from the external client. A local listening port alone does not prove the subscription works.
-5. Remove the temporary clients after the test, or explicitly hand their credentials to the administrator. Back up the SQLite database and the certificate material before adding production clients.
+This command must display `bin/vps.py`. Run `python3 --version` too. The version must be 3.10 or newer.
 
-The launcher cannot perform the external authenticated client test without a real VPS and a client endpoint. It reports playbook completion separately from this acceptance test.
+## 1. Create an SSH key on your Linux computer
 
-## Recovery and reruns
+An SSH key has two files. The file ending in `.pub` is the **public key**. You will copy its contents to the VPS. The other file is the **private key**; it stays on your computer.
 
-The installer refuses to reinstall an existing panel without a separate review, and inbound creation refuses duplicates. This is intentional: `deploy` is a first-deployment path, not a destructive reconciliation loop. After a failed or interrupted stage, **first** verify SSH on the known-good port, `sudo -n`, `sshd -T`, `ssh.socket`, `ufw status`, `systemctl is-active x-ui`, and the local 3x-ui state. Then resume only after inspecting the actual state, for example `python3 bin/vps.py deploy --apply --from-stage cert`. Available stages are `network`, `install`, `token`, `fallback`, `cert`, `subscription`, `vless`, `hysteria`, and `verify`.
+```sh
+mkdir -p "$HOME/.ssh"
+chmod 700 "$HOME/.ssh"
+ssh-keygen -t ed25519 -a 100 -f "$HOME/.ssh/standalone_3x_ui_ed25519"
+```
 
-If SSH is lost, use the provider console. Check the managed drop-ins under `/etc/ssh/sshd_config.d/` and `/etc/systemd/system/ssh.socket.d/`, validate with `sshd -t`, inspect UFW rules, then restore a known-good port before restarting SSH. If panel mutation fails, inspect the on-host SQLite backups under `/root/` before a reviewed restore. Do not rerun a partly completed inbound creation blindly.
+Enter and confirm a passphrase when asked. If `ssh-keygen` says the file exists, answer **no**. Reuse it only if it is your key and its `.pub` file exists. Otherwise choose another filename in **all later commands** and in `.env`.
 
-## Future remote nodes
+Display the public key and keep this terminal open:
 
-The standalone panel can later become the primary controller for native remote nodes. Before registering one, design its own restricted panel/API access, credentials, client placement and subscription visibility. This first-deployment repository does not automatically register or change any other VPS.
+```sh
+cat "$HOME/.ssh/standalone_3x_ui_ed25519.pub"
+```
 
-## Repository layout
+Copy the full line beginning with `ssh-ed25519`. Do not copy the private key.
 
-- `.env.example`: documented non-secret deployment settings.
-- `bin/vps.py`: local validation and staged launcher.
-- `ansible/playbooks/bootstrap.yml`, `network.yml`, `ssh-cutover.yml`, `verify.yml`: standalone access and host lifecycle.
-- `ansible/playbooks/3x-ui-*.yml`, `proxy-fallback-nginx.yml`, `ansible/roles/proxy_fallback_nginx/`: adapted 3x-ui installation and inbound steps.
+## 2. Fill in `.env` on your Linux computer
 
+`.env` is the settings file for this VPS. The repository ignores the real `.env` file in Git. If it already exists, `cp -n` keeps it.
+
+```sh
+cp -n .env.example .env
+nano .env
+```
+
+Change these values first:
+
+| Setting | Enter |
+| --- | --- |
+| `DOMAIN` | Your real domain, such as `vpn.example.com`. Its DNS record must point to the VPS IP. |
+| `VPS_HOST` | The VPS IP address. |
+| `PANEL_ALLOWED_CIDRS` | Your computer's public IPv4 address followed by `/32`, such as `203.0.113.5/32`. |
+| `ACME_EMAIL` | Your email address, or leave it empty. |
+
+On your Linux computer, run `curl -4 https://api.ipify.org` to see its current public IPv4 address. Use that address for `PANEL_ALLOWED_CIDRS`. If your public address later changes, panel access will need a new rule.
+
+The example already uses `22` for the current SSH port, `2322` for the new SSH port, `39089` for the panel, `38443` for subscriptions, and `443` for VLESS. Hysteria2 uses UDP `443` when `ENABLE_HYSTERIA=yes`. Set `ENABLE_HYSTERIA=no` if you do not want that inbound. To keep SSH on `22`, set `CHANGE_SSH_PORT=no` **and** `SSH_TARGET_PORT=22`. Keep the other ports different as shown.
+
+Save `.env` in `nano`: press **Ctrl+O**, **Enter**, then **Ctrl+X**. `Ctrl+O` uses the letter O.
+
+## 3. Sign in to the VPS as root and create ops
+
+Open a **second terminal on your Linux computer**. Replace `YOUR_VPS_IP` with the address from `VPS_HOST`:
+
+```sh
+ssh -p 22 root@YOUR_VPS_IP
+```
+
+If SSH shows a new server fingerprint, compare it with the fingerprint supplied by your VPS provider before typing `yes`. Enter the `root` password. You are now **on the VPS**.
+
+Check the operating system:
+
+```sh
+cat /etc/os-release
+```
+
+Continue only if it says Ubuntu 24.04. Run these commands **on the VPS**:
+
+```sh
+adduser --disabled-password --gecos '' ops
+usermod -aG sudo ops
+install -d -m 0700 -o ops -g ops /home/ops/.ssh
+nano /home/ops/.ssh/authorized_keys
+```
+
+If `nano` is missing on the VPS, run `apt-get update` and `apt-get install -y nano`, then open the file again. Paste the **one public-key line** from step 1. Do not add another line. Press **Ctrl+O**, **Enter**, then **Ctrl+X**.
+
+Still **on the VPS**, set the file permissions and check its line count:
+
+```sh
+chown ops:ops /home/ops/.ssh/authorized_keys
+chmod 0600 /home/ops/.ssh/authorized_keys
+wc -l /home/ops/.ssh/authorized_keys
+```
+
+The last command must start with `1`. Now allow `ops` to use `sudo` without a password:
+
+```sh
+VISUAL=nano EDITOR=nano visudo -f /etc/sudoers.d/90-standalone-ops
+```
+
+Enter exactly this one line in `nano`:
+
+```text
+ops ALL=(ALL:ALL) NOPASSWD:ALL
+```
+
+Press **Ctrl+O**, **Enter**, then **Ctrl+X**. If `visudo` reports a syntax error, correct the line. Then run **on the VPS**:
+
+```sh
+chown root:root /etc/sudoers.d/90-standalone-ops
+chmod 0440 /etc/sudoers.d/90-standalone-ops
+visudo -cf /etc/sudoers.d/90-standalone-ops
+```
+
+The last command must report that the file parsed successfully. Keep the `root` session open for the next step.
+
+## 4. Test the new account
+
+Open a **third terminal on your Linux computer**. Connect on the current SSH port, which is still `22`:
+
+```sh
+ssh -i "$HOME/.ssh/standalone_3x_ui_ed25519" -p 22 ops@YOUR_VPS_IP
+```
+
+After login, run **on the VPS**:
+
+```sh
+sudo -n true
+exit
+```
+
+`sudo -n true` must finish without a password prompt or error. If it fails, fix the public key, permissions, or sudoers file in the still-open `root` session. Once it works, type `exit` in the `root` session too.
+
+## 5. Install 3x-ui from your Linux computer
+
+Return to the **first terminal** in the repository directory. Load your key into an SSH agent. The agent lets the installer use a passphrase-protected key:
+
+```sh
+eval "$(ssh-agent -s)"
+ssh-add "$HOME/.ssh/standalone_3x_ui_ed25519"
+```
+
+Before installation, allow these ports in the **provider firewall**, if your provider has one:
+
+| Port | Who needs access |
+| --- | --- |
+| `22/tcp` | Your computer during setup. Keep it until SSH works on the new port. |
+| `2322/tcp` | Your computer after the SSH port changes. |
+| `80/tcp` | The public internet, for the certificate. |
+| `443/tcp` | Clients using VLESS. |
+| `38443/tcp` | Clients fetching subscriptions. |
+| `443/udp` | Clients using Hysteria2, only when enabled. |
+| `39089/tcp` | Only your administrator IP, for the panel. |
+
+Use your chosen `.env` port numbers if you changed the examples. The installer configures the VPS firewall. It cannot configure the provider firewall. Once SSH works on `2322`, remove the old `22/tcp` provider rule if you changed ports.
+
+Run these commands **on your Linux computer**, one at a time:
+
+1. Display the settings and check the ports:
+
+   ```sh
+   python3 bin/vps.py plan
+   ```
+
+2. Check access and preview firewall changes. This command does not change the VPS:
+
+   ```sh
+   python3 bin/vps.py check-network
+   ```
+
+3. Install 3x-ui. This command changes the VPS and moves SSH to the selected port:
+
+   ```sh
+   python3 bin/vps.py deploy --apply
+   ```
+
+4. Check the installed services and ports:
+
+   ```sh
+   python3 bin/vps.py verify
+   ```
+
+## 6. Open the panel and test a client
+
+After installation, SSH uses the port in `SSH_TARGET_PORT`. For the example settings, run this **on your Linux computer**:
+
+```sh
+ssh -i "$HOME/.ssh/standalone_3x_ui_ed25519" -p 2322 ops@YOUR_VPS_IP
+```
+
+After login, read the credentials **on the VPS**:
+
+```sh
+sudo cat /etc/x-ui/install-result.env
+```
+
+Read the login details and panel path from that file. Take the domain and panel port from `.env`. Keep the login details private. Open the panel from the IP allowed by `PANEL_ALLOWED_CIDRS`. A subscription is an address that gives clients their connection settings.
+
+An inbound is a protocol and port that clients connect to.
+
+1. In the panel, find the VLESS/TLS inbound. Find the Hysteria2 inbound too if you enabled it.
+2. Create one test client on each enabled inbound. Copy each client link to a device outside the VPS network.
+3. Connect with that device and confirm traffic works. Open its subscription URL and refresh it.
+4. Remove the test clients when you finish.
+
+The installer checks services and ports. Only this external client test proves that a real client can connect.
+
+## If a command stops
+
+Do not repeat `deploy --apply` without checking the VPS state. The installer can leave completed stages in place. Check SSH on the last working port and run `python3 bin/vps.py verify` when access works. If SSH fails, use the provider recovery console.
+
+The panel version is pinned in `X_UI_VERSION` and the installer playbook. A future release needs a reviewed update; this guide does not select one automatically. This VPS can later become a controller for other 3x-ui nodes, but this installation changes only this VPS.
+
+If your provider blocks `root` login over SSH, use the separate [provider-console procedure](docs/bootstrap-console.md). If you use Windows, see the [Windows key commands](docs/ssh-keys-windows.md); run the installer in Linux or WSL.
