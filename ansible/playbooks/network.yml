@@ -77,7 +77,7 @@
         - enable_hysteria | bool
         - not ansible_check_mode
 
-    - name: Restrict administrator panel to reviewed sources
+    - name: Allow panel access from configured sources
       ansible.builtin.command: "ufw allow from {{ item }} to any port {{ panel_port }} proto tcp"
       loop: "{{ panel_allowed_cidrs }}"
       register: network_panel_allow

@@ -64,10 +64,7 @@ Change these values first:
 | --- | --- |
 | `DOMAIN` | Your real domain, such as `vpn.example.com`. Its DNS record must point to the VPS IP. |
 | `VPS_HOST` | The VPS IP address. |
-| `PANEL_ALLOWED_CIDRS` | Your computer's public IPv4 address followed by `/32`, such as `203.0.113.5/32`. |
-| `ACME_EMAIL` | Your email address, or leave it empty. |
-
-On your Linux computer, run `curl -4 https://api.ipify.org` to see its current public IPv4 address. Use that address for `PANEL_ALLOWED_CIDRS`. If your public address later changes, panel access will need a new rule.
+| `PANEL_ALLOWED_CIDRS` | Keep `0.0.0.0/0` to open the panel from any IPv4 address. |
 
 The example already uses `22` for the current SSH port, `2322` for the new SSH port, `39089` for the panel, `38443` for subscriptions, and `443` for VLESS. Hysteria2 uses UDP `443` when `ENABLE_HYSTERIA=yes`. Set `ENABLE_HYSTERIA=no` if you do not want that inbound. To keep SSH on `22`, set `CHANGE_SSH_PORT=no` **and** `SSH_TARGET_PORT=22`. Keep the other ports different as shown.
 
@@ -166,7 +163,7 @@ Before installation, allow these ports in the **provider firewall**, if your pro
 | `443/tcp` | Clients using VLESS. |
 | `38443/tcp` | Clients fetching subscriptions. |
 | `443/udp` | Clients using Hysteria2, only when enabled. |
-| `39089/tcp` | Only your administrator IP, for the panel. |
+| `39089/tcp` | The public internet, for the panel. |
 
 Use your chosen `.env` port numbers if you changed the examples. The installer configures the VPS firewall. It cannot configure the provider firewall. Once SSH works on `2322`, remove the old `22/tcp` provider rule if you changed ports.
 
@@ -210,7 +207,7 @@ After login, read the credentials **on the VPS**:
 sudo cat /etc/x-ui/install-result.env
 ```
 
-Read the login details and panel path from that file. Take the domain and panel port from `.env`. Keep the login details private. Open the panel from the IP allowed by `PANEL_ALLOWED_CIDRS`. A subscription is an address that gives clients their connection settings.
+Read the login details and panel path from that file. Take the domain and panel port from `.env`. Keep the login details private. Open the panel from any IPv4 address. A subscription is an address that gives clients their connection settings.
 
 An inbound is a protocol and port that clients connect to.
 

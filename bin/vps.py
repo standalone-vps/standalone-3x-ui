@@ -20,7 +20,7 @@ ENV_KEYS = {
     "DOMAIN", "VPS_HOST", "BOOTSTRAP_SSH_PORT", "OPS_USER", "SSH_KEY_PATH",
     "CHANGE_SSH_PORT", "SSH_TARGET_PORT", "PANEL_PORT", "PANEL_ALLOWED_CIDRS",
     "SUBSCRIPTION_PORT", "VLESS_PORT", "ENABLE_HYSTERIA", "HYSTERIA_PORT",
-    "ACME_EMAIL", "X_UI_VERSION",
+    "X_UI_VERSION",
 }
 PORT_KEYS = ("BOOTSTRAP_SSH_PORT", "SSH_TARGET_PORT", "PANEL_PORT", "SUBSCRIPTION_PORT", "VLESS_PORT", "HYSTERIA_PORT")
 DOMAIN_RE = re.compile(r"^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$")
@@ -76,8 +76,6 @@ def load_env(path: Path) -> dict[str, str]:
             net = ipaddress.ip_network(part, strict=False)
         except ValueError as exc:
             raise ValueError(f"Invalid panel CIDR: {part}") from exc
-        if net.prefixlen == 0:
-            raise ValueError("The administrator panel cannot be open to everyone")
     settings["PANEL_ALLOWED_CIDRS"] = ",".join(cidrs)
     if settings["CHANGE_SSH_PORT"] == "no":
         if settings["SSH_TARGET_PORT"] != settings["BOOTSTRAP_SSH_PORT"]:
@@ -106,7 +104,8 @@ def plan(config: dict[str, str]) -> None:
     print(f"Final SSH: TCP {ssh_port}; change: {config['CHANGE_SSH_PORT']}")
     print(f"Public TCP: 80 (ACME), {config['VLESS_PORT']} (VLESS TLS), {config['SUBSCRIPTION_PORT']} (subscription)")
     print(f"Public UDP: {config['HYSTERIA_PORT']} (Hysteria2)" if config["ENABLE_HYSTERIA"] == "yes" else "Hysteria2 disabled; no UDP allow")
-    print(f"Panel TCP {config['PANEL_PORT']} restricted to {config['PANEL_ALLOWED_CIDRS']}")
+    panel_scope = "public IPv4" if "0.0.0.0/0" in config["PANEL_ALLOWED_CIDRS"].split(",") else config["PANEL_ALLOWED_CIDRS"]
+    print(f"Panel TCP {config['PANEL_PORT']} allowed from {panel_scope}")
     if ssh_port == "22":
         print("WARNING: Final SSH port 22 is an explicit exception to the source fleet policy.")
     print("Check provider firewall, public DNS, provider console and external client reachability before applying.")
@@ -220,7 +219,7 @@ def deploy(config: dict[str, str], *, check: bool, start: str = "network") -> No
             ansible(config, "proxy-fallback-nginx.yml", {**panel_vars, "allow_proxy_fallback_nginx": True})
         elif stage == "cert":
             ansible(config, "3x-ui-cert-panel.yml", {**panel_vars, "allow_x_ui_certificate_apply": True,
-                    "x_ui_domain": config["DOMAIN"], "x_ui_acme_account_email": config["ACME_EMAIL"]})
+                    "x_ui_domain": config["DOMAIN"]})
         elif stage == "subscription":
             ansible(config, "3x-ui-subscription-controller-port.yml", {**panel_vars, "x_ui_subscription_port": int(config["SUBSCRIPTION_PORT"]),
                     "x_ui_subscription_controller_alias": "standalone", "allow_x_ui_subscription_port_apply": True})

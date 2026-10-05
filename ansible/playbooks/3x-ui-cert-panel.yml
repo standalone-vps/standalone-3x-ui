@@ -8,7 +8,6 @@
     x_ui_domain: ""
     x_ui_issue_certificate: true
     x_ui_set_panel_certificate: true
-    x_ui_acme_account_email: ""
     x_ui_binary_path: /usr/local/x-ui/x-ui
     x_ui_acme_path: /root/.acme.sh/acme.sh
     x_ui_cert_dir: "/root/cert/{{ x_ui_domain }}"
@@ -36,7 +35,6 @@
         msg:
           - "This playbook uses an x-ui-compatible ACME layout under /root/cert/<domain>/ and applies panel TLS via x-ui cert."
           - "HTTP validation requires public DNS to this host and port 80 reachable."
-          - "ACME account email is optional to match the x-ui SSL menu flow; set x_ui_acme_account_email if you want to register one."
           - "Rollback: re-run x-ui cert with the previous fullchain/key paths or restore panel settings from backup."
 
   tasks:
@@ -99,9 +97,7 @@
 
     - name: Install acme.sh for x-ui-compatible certificate issuance
       ansible.builtin.shell:
-        cmd: >-
-          curl https://get.acme.sh | sh
-          {% if x_ui_acme_account_email | length > 0 %}-s email={{ x_ui_acme_account_email | quote }}{% endif %}
+        cmd: curl https://get.acme.sh | sh
         creates: "{{ x_ui_acme_path }}"
       when:
         - x_ui_issue_certificate | bool

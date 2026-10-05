@@ -59,7 +59,7 @@
           - verify_runtime.tcp[vless_port | string] | bool
           - not (enable_hysteria | bool) or verify_runtime.udp_hysteria | bool
           - verify_runtime.ufw_active | bool
-          - not verify_runtime.panel_public_rule | bool
+          - (verify_runtime.panel_public_rule | bool) == ('0.0.0.0/0' in panel_allowed_cidrs)
           - verify_runtime.ssh_key_only | bool
           - verify_runtime.services['x-ui.service'] | bool
           - verify_runtime.services['nginx.service'] | bool

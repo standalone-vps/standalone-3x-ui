@@ -23,11 +23,18 @@ def test_example_has_valid_complete_plan(tmp_path):
     parsed = vps.load_env(config(tmp_path))
     assert parsed["HYSTERIA_PORT"] == "443"
     assert parsed["SSH_TARGET_PORT"] == "2322"
+    assert "ACME_EMAIL" not in parsed
 
 
 def test_keeping_current_ssh_port_is_supported(tmp_path):
     parsed = vps.load_env(config(tmp_path, CHANGE_SSH_PORT="no", SSH_TARGET_PORT="22"))
     assert parsed["SSH_TARGET_PORT"] == parsed["BOOTSTRAP_SSH_PORT"]
+
+
+def test_public_panel_is_supported(tmp_path, capsys):
+    parsed = vps.load_env(config(tmp_path, PANEL_ALLOWED_CIDRS="0.0.0.0/0"))
+    vps.plan(parsed)
+    assert "public IPv4" in capsys.readouterr().out
 
 
 def test_hysteria_can_be_disabled_without_opening_udp(tmp_path, capsys):
@@ -39,7 +46,6 @@ def test_hysteria_can_be_disabled_without_opening_udp(tmp_path, capsys):
 @pytest.mark.parametrize("changes", [
     {"PANEL_PORT": "443"},
     {"SUBSCRIPTION_PORT": "80"},
-    {"PANEL_ALLOWED_CIDRS": "0.0.0.0/0"},
     {"CHANGE_SSH_PORT": "no"},
     {"SSH_TARGET_PORT": "22"},
 ])
