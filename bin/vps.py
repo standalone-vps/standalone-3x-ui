@@ -90,7 +90,7 @@ def load_env(path: Path) -> dict[str, str]:
         raise ValueError("SSH, panel, subscription, VLESS and ACME TCP 80 ports must be distinct")
     if settings["CHANGE_SSH_PORT"] == "yes" and int(settings["BOOTSTRAP_SSH_PORT"]) in tcp_ports[1:] + [80]:
         raise ValueError("Current SSH port conflicts with a planned TCP service")
-    if not settings["X_UI_VERSION"].startswith("v") or settings["X_UI_VERSION"] not in ("v3.7.0",):
+    if not settings["X_UI_VERSION"].startswith("v") or settings["X_UI_VERSION"] not in ("v3.9.0",):
         raise ValueError("X_UI_VERSION must be an exact reviewed tag supported by the installer")
     key = Path(settings["SSH_KEY_PATH"]).expanduser()
     if not key.is_absolute():

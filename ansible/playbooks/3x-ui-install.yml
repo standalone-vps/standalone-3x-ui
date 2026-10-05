@@ -4,12 +4,11 @@
   gather_facts: true
   become: true
   vars:
-    x_ui_version: v3.7.0
+    x_ui_version: v3.9.0
     allow_x_ui_reinstall: false
     # SHA256 of upstream install.sh at the exact release tag; review before adding a version.
     x_ui_install_sha256_by_version:
-      v3.6.0: 7bb41e811f2107a3182da9090f24893d3612b5b6310194a7dd1f9965ff29e0c8
-      v3.7.0: a7f4fedcea3abe8987508d00f29834b8872e4e4e5059159eb19460d474b37cdc
+      v3.9.0: 18616fe26c8f6c92db6daa2dcd7cd53c5143ee69ecfd26d8ea6dc9b2c78607a6
     x_ui_install_script_path: /tmp/3x-ui-install.sh
     x_ui_install_log_path: /root/3x-ui-install.log
     x_ui_database_path: /etc/x-ui/x-ui.db

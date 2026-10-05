@@ -11,7 +11,7 @@ The source playbooks were adapted from `vps-fleet-ops` at repository creation. T
 - Python 3.10+, `ansible-core`, OpenSSH client and `ssh-keygen`; `sshpass` is required by Ansible's interactive `--ask-pass` bootstrap mode.
 - A new Ubuntu 24.04 VPS with working provider console, initial root/password access through SSH or that console, a public IPv4 address, and enough memory and disk for 3x-ui and Nginx.
 - A public DNS name resolving to the VPS. Confirm provider firewall allows the selected SSH, `80/tcp`, VLESS TCP, subscription TCP, and optional Hysteria UDP ports. Panel access should allow only the configured administration CIDRs.
-- Review the 3x-ui installer tag and SHA256 in `ansible/playbooks/3x-ui-install.yml` before deployment. This repository pins `v3.7.0`; it does not silently select a newer release.
+- Review the 3x-ui installer tag and SHA256 in `ansible/playbooks/3x-ui-install.yml` before deployment. This repository pins [`v3.9.0`](https://github.com/MHSanaei/3x-ui/releases/tag/v3.9.0), verified as GitHub's latest stable release on 2026-10-05; it does not silently select a newer release.
 
 Real settings, credentials, backups and exports are excluded from Git. The root password is requested by Ansible at the terminal during bootstrap and is never stored in `.env`. Before bootstrap, compare the VPS SSH host-key fingerprint with the provider console and add the verified key to local `known_hosts`. Use the [console bootstrap guide](docs/bootstrap-console.md) if root SSH is disabled. The launcher uses `StrictHostKeyChecking=yes` and never auto-accepts a new host key.
 
