@@ -1,5 +1,7 @@
 # Установка 3x-ui на новый VPS
 
+[![CI](https://github.com/standalone-vps/standalone-3x-ui/actions/workflows/ci.yml/badge.svg)](https://github.com/standalone-vps/standalone-3x-ui/actions/workflows/ci.yml)
+
 [English version](README.md)
 
 Эта инструкция рассчитана на **компьютер с Linux** или **Windows с Ubuntu в WSL**, а также **новый VPS с Ubuntu 24.04**. Вы входите на VPS по SSH как `root` с паролем. Затем создаёте пользователя `ops` и устанавливаете 3x-ui из терминала Linux.
@@ -281,4 +283,4 @@ UFW блокирует IPv6 вне внутреннего интерфейса V
 
 ## Файлы проекта
 
-[Лицензия MIT](LICENSE) разрешает использовать проект. Перед предложением изменений прочитайте [правила участия](CONTRIBUTING.ru.md). Об уязвимости сообщите по [инструкции по безопасности](SECURITY.ru.md). CI проверяет Python и тесты после каждого изменения в GitHub. Он не подключается к VPS.
+[Лицензия MIT](LICENSE) разрешает использовать проект. На странице [«Помощь»](SUPPORT.ru.md) указано, куда задать вопрос. [Правила общения](CODE_OF_CONDUCT.ru.md) действуют в обсуждениях проекта. Перед предложением изменений прочитайте [правила участия](CONTRIBUTING.ru.md). Об уязвимости сообщите по [инструкции по безопасности](SECURITY.ru.md). CI проверяет Python и тесты после каждого изменения в GitHub. Он не подключается к VPS.

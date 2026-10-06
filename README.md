@@ -1,5 +1,7 @@
 # Set up a new 3x-ui VPS
 
+[![CI](https://github.com/standalone-vps/standalone-3x-ui/actions/workflows/ci.yml/badge.svg)](https://github.com/standalone-vps/standalone-3x-ui/actions/workflows/ci.yml)
+
 [Читать по-русски](README.ru.md)
 
 This guide starts with a **Linux computer**, or **Windows with Ubuntu in WSL**, and a **new Ubuntu 24.04 VPS**. You can sign in to the VPS as `root` with a password over SSH. You will create an `ops` account, then install 3x-ui from a Linux terminal.
@@ -281,4 +283,4 @@ If your provider blocks `root` login over SSH, use the separate [provider-consol
 
 ## Project files
 
-The [MIT license](LICENSE) permits reuse. Read [Contributing](CONTRIBUTING.md) before sending a change, and [Security](SECURITY.md) before reporting a vulnerability. CI checks Python syntax and tests on every push and pull request; it never connects to a VPS.
+The [MIT license](LICENSE) permits reuse. [Support](SUPPORT.md) explains where to ask for help. [Code of conduct](CODE_OF_CONDUCT.md) sets the rules for project discussions. Read [Contributing](CONTRIBUTING.md) before sending a change, and [Security](SECURITY.md) before reporting a vulnerability. CI checks Python syntax and tests on every push and pull request; it never connects to a VPS.
