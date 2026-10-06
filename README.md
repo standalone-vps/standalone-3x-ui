@@ -278,3 +278,7 @@ Do not repeat `deploy --apply` without checking the VPS state. The installer can
 The panel version is pinned in `X_UI_VERSION` and the installer playbook. A future release needs a reviewed update; this guide does not select one automatically. This VPS can later become a controller for other 3x-ui nodes, but this installation changes only this VPS.
 
 If your provider blocks `root` login over SSH, use the separate [provider-console procedure](docs/bootstrap-console.md). The [Windows/WSL key guide](docs/ssh-keys-windows.md) explains how to create the key directly in Ubuntu.
+
+## Project files
+
+The [MIT license](LICENSE) permits reuse. Read [Contributing](CONTRIBUTING.md) before sending a change, and [Security](SECURITY.md) before reporting a vulnerability. CI checks Python syntax and tests on every push and pull request; it never connects to a VPS.

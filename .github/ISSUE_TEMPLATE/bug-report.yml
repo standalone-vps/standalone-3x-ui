@@ -1,0 +1,33 @@
+name: Bug report
+description: Report an installer or documentation problem without sharing secrets.
+title: "[Bug] "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Remove real IP addresses, domains, passwords, tokens, client links and subscription URLs from all text and logs. Do not upload `.env` or `/etc/x-ui/install-result.env`. For vulnerabilities, follow SECURITY.md.
+  - type: input
+    id: step
+    attributes:
+      label: Command or documentation step
+      placeholder: "For example: python3 bin/vps.py check-network"
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected result
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual result and sanitized error
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Local OS and VPS Ubuntu version
+      placeholder: "Ubuntu 24.04 local / Ubuntu 24.04 VPS"
