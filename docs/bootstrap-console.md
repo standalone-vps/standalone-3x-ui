@@ -17,7 +17,7 @@ Linux/WSL key → provider console as root → create ops → test SSH → insta
    cat "$HOME/.ssh/standalone_3x_ui_ed25519.pub"
    ```
 
-   Enter a passphrase. If the key already exists, do not overwrite it; only display its `.pub` file. On Windows, use the PowerShell and WSL commands in [step 1 of the main guide](../README.md). Copy the full public line beginning with `ssh-ed25519`.
+   Enter a passphrase. If the key already exists, do not overwrite it; only display its `.pub` file. On Windows, create the key in Ubuntu under WSL as shown in [step 1 of the main guide](../README.md). Copy the full public line beginning with `ssh-ed25519`.
 
 2. Open the provider's browser console and sign in to the VPS as `root`. Run **on the VPS**:
 

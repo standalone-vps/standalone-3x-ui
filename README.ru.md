@@ -39,9 +39,9 @@ sudo apt install -y ansible-core openssh-client python3 nano curl
    sudo apt install -y ansible-core openssh-client python3 nano curl
    ```
 
-4. Откройте папку репозитория в терминале Ubuntu. Диск Windows `C:` находится по пути `/mnt/c/`.
+4. Храните репозиторий внутри Ubuntu, например в `~/projects/standalone-3x-ui`. Откройте эту папку в терминале Ubuntu. Не запускайте установщик из `/mnt/c/`: Ansible может отклонить права на диске Windows.
 
-После команд создания ключа в PowerShell выполняйте остальные команды **в терминале Linux или Ubuntu**.
+Все следующие команды, включая создание SSH-ключа, выполняйте **в терминале Linux или Ubuntu**. Агент, который проводит установку, должен работать в той же среде Linux.
 
 Проверьте, что терминал открыт в папке репозитория:
 
@@ -55,7 +55,7 @@ ls bin/vps.py
 
 SSH-ключ состоит из двух файлов. Файл с окончанием `.pub` — **публичный ключ**. Его содержимое вы перенесёте на VPS. Второй файл — **приватный ключ**. Он остаётся на вашем компьютере.
 
-**Linux:** выполните в терминале Linux:
+Выполните в **терминале Linux или Ubuntu**:
 
 ```sh
 mkdir -p "$HOME/.ssh"
@@ -63,38 +63,9 @@ chmod 700 "$HOME/.ssh"
 ssh-keygen -t ed25519 -a 100 -f "$HOME/.ssh/standalone_3x_ui_ed25519"
 ```
 
-**Windows:** выполните в **PowerShell**. Если `ssh-keygen.exe` не найден, выполните `Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0` в PowerShell от имени администратора.
-
-```powershell
-New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\.ssh" | Out-Null
-ssh-keygen.exe -t ed25519 -a 100 -f "$env:USERPROFILE\.ssh\standalone_3x_ui_ed25519"
-Get-Content "$env:USERPROFILE\.ssh\standalone_3x_ui_ed25519.pub"
-```
-
 Придумайте парольную фразу, введите её и подтвердите. Если `ssh-keygen` сообщает, что файл существует, ответьте **no**. Используйте его, только если это ваш ключ и рядом есть файл `.pub`. Иначе выберите другое имя **во всех следующих командах** и в `.env`.
 
-В Linux покажите публичный ключ:
-
-```sh
-cat "$HOME/.ssh/standalone_3x_ui_ed25519.pub"
-```
-
-Скопируйте всю строку, которая начинается с `ssh-ed25519`. Приватный ключ на VPS не копируйте.
-
-**Windows:** перенесите ключ в Ubuntu перед установкой. Выполните этот блок **в терминале Ubuntu**:
-
-```sh
-windows_profile="$(wslpath "$(cmd.exe /c echo %USERPROFILE% | tr -d '\r')")"
-install -d -m 700 "$HOME/.ssh"
-if [ -e "$HOME/.ssh/standalone_3x_ui_ed25519" ] || [ -e "$HOME/.ssh/standalone_3x_ui_ed25519.pub" ]; then
-  echo "В WSL уже есть ключ. Остановитесь и проверьте его."
-else
-  install -m 600 "$windows_profile/.ssh/standalone_3x_ui_ed25519" "$HOME/.ssh/standalone_3x_ui_ed25519"
-  install -m 644 "$windows_profile/.ssh/standalone_3x_ui_ed25519.pub" "$HOME/.ssh/standalone_3x_ui_ed25519.pub"
-fi
-```
-
-Установщик использует эту копию в WSL. Оставьте `SSH_KEY_PATH=~/.ssh/standalone_3x_ui_ed25519` в `.env`.
+Приватный ключ хранится в домашней папке Linux или WSL. Публичный ключ вы покажете и скопируете в шаге 3, когда VPS будет готов его принять.
 
 ## 2. Заполните `.env`
 
@@ -104,6 +75,8 @@ fi
 cp -n .env.ru.example .env
 nano .env
 ```
+
+Оставьте `SSH_KEY_PATH=~/.ssh/standalone_3x_ui_ed25519`. Это путь к приватному ключу, а не его содержимое.
 
 Сначала измените эти значения:
 
@@ -139,10 +112,23 @@ cat /etc/os-release
 adduser --disabled-password --gecos '' ops
 usermod -aG sudo ops
 install -d -m 0700 -o ops -g ops /home/ops/.ssh
+```
+
+Если на VPS нет `nano`, выполните `apt-get update` и `apt-get install -y nano` сейчас.
+
+Вернитесь в **первый, локальный терминал Linux или Ubuntu**. Покажите публичный ключ:
+
+```sh
+cat "$HOME/.ssh/standalone_3x_ui_ed25519.pub"
+```
+
+Скопируйте всю строку, которая начинается с `ssh-ed25519`. Приватный ключ на VPS не копируйте. Сразу вернитесь во **второй терминал с root на VPS** и откройте файл:
+
+```sh
 nano /home/ops/.ssh/authorized_keys
 ```
 
-Если на VPS нет `nano`, выполните `apt-get update` и `apt-get install -y nano`. Затем снова откройте файл. Вставьте **одну строку публичного ключа** из шага 1. Не добавляйте вторую строку. Нажмите **Ctrl+O**, **Enter**, затем **Ctrl+X**.
+Вставьте **одну строку публичного ключа**. Не добавляйте вторую строку. Нажмите **Ctrl+O**, **Enter**, затем **Ctrl+X**.
 
 Оставаясь **на VPS**, задайте права и проверьте число строк:
 
@@ -291,4 +277,4 @@ UFW блокирует IPv6 вне внутреннего интерфейса V
 
 Версия панели закреплена в `X_UI_VERSION` и плейбуке установки. Для новой версии нужен отдельный проверенный выпуск репозитория. Этот VPS сможет стать основным узлом для других серверов позднее. Сейчас установка меняет только этот VPS.
 
-Если провайдер запретил SSH-вход `root`, используйте отдельную [инструкцию для консоли провайдера](docs/bootstrap-console.ru.md). [Справка по ключу Windows](docs/ssh-keys-windows.ru.md) повторяет команды PowerShell и перенос ключа в WSL.
+Если провайдер запретил SSH-вход `root`, используйте отдельную [инструкцию для консоли провайдера](docs/bootstrap-console.ru.md). [Инструкция по ключу для Windows/WSL](docs/ssh-keys-windows.ru.md) объясняет, как создать ключ прямо в Ubuntu.

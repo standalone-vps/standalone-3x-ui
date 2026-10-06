@@ -39,9 +39,9 @@ Other Linux distributions need the same tools from their own package manager.
    sudo apt install -y ansible-core openssh-client python3 nano curl
    ```
 
-4. Open the repository directory in the Ubuntu terminal. Windows drive `C:` appears under `/mnt/c/`.
+4. Keep the repository inside Ubuntu, for example under `~/projects/standalone-3x-ui`. Open that directory in the Ubuntu terminal. Do not run the installer from `/mnt/c/`: Ansible may reject permissions on the Windows drive.
 
-All commands after the PowerShell key commands below run in the **Linux or Ubuntu terminal**.
+Run every remaining command, including SSH key creation, in your **Linux or Ubuntu terminal**. An agent running the installation should use this same Linux environment.
 
 Check that you are in the repository directory:
 
@@ -55,7 +55,7 @@ This command must display `bin/vps.py`. Run `python3 --version` too. The version
 
 An SSH key has two files. The file ending in `.pub` is the **public key**. You will copy its contents to the VPS. The other file is the **private key**; it stays on your computer.
 
-**Linux:** run these commands in the Linux terminal:
+Run these commands in your **Linux or Ubuntu terminal**:
 
 ```sh
 mkdir -p "$HOME/.ssh"
@@ -63,38 +63,9 @@ chmod 700 "$HOME/.ssh"
 ssh-keygen -t ed25519 -a 100 -f "$HOME/.ssh/standalone_3x_ui_ed25519"
 ```
 
-**Windows:** run these commands in **PowerShell**. If `ssh-keygen.exe` is missing, run `Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0` in Administrator PowerShell.
-
-```powershell
-New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\.ssh" | Out-Null
-ssh-keygen.exe -t ed25519 -a 100 -f "$env:USERPROFILE\.ssh\standalone_3x_ui_ed25519"
-Get-Content "$env:USERPROFILE\.ssh\standalone_3x_ui_ed25519.pub"
-```
-
 Enter and confirm a passphrase when asked. If `ssh-keygen` says the file exists, answer **no**. Reuse it only if it is your key and its `.pub` file exists. Otherwise choose another filename in **all later commands** and in `.env`.
 
-On Linux, display the public key:
-
-```sh
-cat "$HOME/.ssh/standalone_3x_ui_ed25519.pub"
-```
-
-Copy the full line beginning with `ssh-ed25519`. Never copy the private key to the VPS.
-
-**Windows:** copy the key into Ubuntu before installation. Run this block in the **Ubuntu terminal**:
-
-```sh
-windows_profile="$(wslpath "$(cmd.exe /c echo %USERPROFILE% | tr -d '\r')")"
-install -d -m 700 "$HOME/.ssh"
-if [ -e "$HOME/.ssh/standalone_3x_ui_ed25519" ] || [ -e "$HOME/.ssh/standalone_3x_ui_ed25519.pub" ]; then
-  echo "A key already exists in WSL. Stop and inspect it."
-else
-  install -m 600 "$windows_profile/.ssh/standalone_3x_ui_ed25519" "$HOME/.ssh/standalone_3x_ui_ed25519"
-  install -m 644 "$windows_profile/.ssh/standalone_3x_ui_ed25519.pub" "$HOME/.ssh/standalone_3x_ui_ed25519.pub"
-fi
-```
-
-The installer uses this WSL copy. Keep `SSH_KEY_PATH=~/.ssh/standalone_3x_ui_ed25519` in `.env`.
+The private key stays in your Linux or WSL home directory. You will display and copy the public key when the VPS is ready for it in step 3.
 
 ## 2. Fill in `.env`
 
@@ -104,6 +75,8 @@ The installer uses this WSL copy. Keep `SSH_KEY_PATH=~/.ssh/standalone_3x_ui_ed2
 cp -n .env.example .env
 nano .env
 ```
+
+Keep `SSH_KEY_PATH=~/.ssh/standalone_3x_ui_ed25519`. This is the path to the private key, not its contents.
 
 Change these values first:
 
@@ -139,10 +112,23 @@ Continue only if it says Ubuntu 24.04. Run these commands **on the VPS**:
 adduser --disabled-password --gecos '' ops
 usermod -aG sudo ops
 install -d -m 0700 -o ops -g ops /home/ops/.ssh
+```
+
+If `nano` is missing on the VPS, run `apt-get update` and `apt-get install -y nano` now.
+
+Return to your **first, local Linux or Ubuntu terminal**. Display the public key:
+
+```sh
+cat "$HOME/.ssh/standalone_3x_ui_ed25519.pub"
+```
+
+Copy the full line beginning with `ssh-ed25519`. Never copy the private key to the VPS. Return directly to the **root terminal on the VPS** and open the file:
+
+```sh
 nano /home/ops/.ssh/authorized_keys
 ```
 
-If `nano` is missing on the VPS, run `apt-get update` and `apt-get install -y nano`, then open the file again. Paste the **one public-key line** from step 1. Do not add another line. Press **Ctrl+O**, **Enter**, then **Ctrl+X**.
+Paste the **one public-key line**. Do not add another line. Press **Ctrl+O**, **Enter**, then **Ctrl+X**.
 
 Still **on the VPS**, set the file permissions and check its line count:
 
@@ -291,4 +277,4 @@ Do not repeat `deploy --apply` without checking the VPS state. The installer can
 
 The panel version is pinned in `X_UI_VERSION` and the installer playbook. A future release needs a reviewed update; this guide does not select one automatically. This VPS can later become a controller for other 3x-ui nodes, but this installation changes only this VPS.
 
-If your provider blocks `root` login over SSH, use the separate [provider-console procedure](docs/bootstrap-console.md). The [Windows key reference](docs/ssh-keys-windows.md) repeats the PowerShell commands and explains the WSL key copy.
+If your provider blocks `root` login over SSH, use the separate [provider-console procedure](docs/bootstrap-console.md). The [Windows/WSL key guide](docs/ssh-keys-windows.md) explains how to create the key directly in Ubuntu.
